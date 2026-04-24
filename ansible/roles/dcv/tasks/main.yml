@@ -350,6 +350,11 @@
     url: https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
     dest: /tmp/google-chrome-stable_current_amd64.deb
     mode: "0644"
+    timeout: 120
+  register: dcv_chrome_download
+  retries: 5
+  delay: 15
+  until: dcv_chrome_download is succeeded
   when: dcv_install_dev_toolchain
 
 - name: Install Google Chrome
@@ -362,6 +367,11 @@
     url: https://update.code.visualstudio.com/latest/linux-deb-x64/stable
     dest: /tmp/code_latest_amd64.deb
     mode: "0644"
+    timeout: 180
+  register: dcv_vscode_download
+  retries: 6
+  delay: 20
+  until: dcv_vscode_download is succeeded
   when: dcv_install_dev_toolchain
 
 - name: Install Visual Studio Code

@@ -323,7 +323,7 @@ resource "aws_instance" "dcv" {
   subnet_id                            = aws_subnet.private.id
   vpc_security_group_ids               = [aws_security_group.dcv.id]
   key_name                             = aws_key_pair.main.key_name
-  instance_initiated_shutdown_behavior = "stop"
+  instance_initiated_shutdown_behavior = var.dcv_use_spot ? null : "stop"
   associate_public_ip_address          = false
   private_ip                           = length(var.dcv_private_ips) > 0 ? var.dcv_private_ips[count.index] : null
 
