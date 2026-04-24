@@ -9,6 +9,7 @@ source "$SCRIPT_DIR/load_local_tooling.sh"
 source "$SCRIPT_DIR/validate_env.sh" --scope=ansible "$ROOT_DIR/.env"
 "$SCRIPT_DIR/ensure_terraform_outputs.sh" >/dev/null
 "$SCRIPT_DIR/generate_inventory.sh"
+"$SCRIPT_DIR/wait_for_vpn_ssh.sh"
 
 export S3_BUCKET_NAME="$(cd "$ROOT_DIR/terraform" && terraform output -raw s3_bucket_name)"
 export ANSIBLE_CONFIG="$ROOT_DIR/ansible/ansible.cfg"
