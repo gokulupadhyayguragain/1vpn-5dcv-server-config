@@ -1,0 +1,9 @@
+---
+# VPN PLAY BLOCK
+# CONFIGURES THE PUBLIC VPN/NAT HOST WITH SECURITY AND PIVPN.
+- name: Configure VPN server
+  hosts: vpn
+  become: true
+  roles:
+    - role: common
+    - role: vpn

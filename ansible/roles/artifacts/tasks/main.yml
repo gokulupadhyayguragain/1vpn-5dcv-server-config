@@ -1,0 +1,150 @@
+---
+# ARTIFACT RECORD BLOCK
+# BUILDS A PER-USER RECORD SO THE VPN PROFILE, DCV TARGET, AND PASSWORD CAN BE WRITTEN LOCALLY AND UPLOADED TO S3 CONSISTENTLY.
+- name: Assert that the S3 bucket name is available for artifact upload
+  ansible.builtin.assert:
+    that:
+      - s3_bucket_name | trim | length > 0
+    fail_msg: "S3_BUCKET_NAME IS EMPTY. EXPORT THE TERRAFORM OUTPUT BEFORE RUNNING THE ARTIFACT PLAY."
+
+- name: Derive the VPN public endpoint mode for connection info
+  ansible.builtin.set_fact:
+    vpn_public_endpoint_mode: "{{ 'terraform_managed_elastic_ip' if ((lookup('env', 'CREATE_VPN_EIP') | default('true', true) | trim | lower) == 'true') else ('existing_elastic_ip' if ((lookup('env', 'VPN_EIP_ALLOCATION_ID') | default('', true) | trim) != '') else 'ephemeral_public_ip') }}"
+
+- name: Build VPN artifact records for each dedicated user
+  ansible.builtin.set_fact:
+    vpn_artifact_records: "{{ (vpn_artifact_records | default([])) + [artifact_record] }}"
+  vars:
+    artifact_record:
+      user: "{{ item }}"
+      dcv_host_name: "dcv-{{ artifact_index + 1 }}"
+      dcv_private_ip: "{{ hostvars[groups['dcv'][artifact_index]].ansible_host }}"
+      dcv_password: "{{ lookup('env', 'DCV_PASSWORD_' ~ (item | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_legacy_session_password, true) }}"
+      local_dir: "{{ artifacts_local_dir }}/{{ item }}"
+      local_profile_path: "{{ artifacts_local_dir }}/{{ item }}/{{ item }}.conf"
+      local_connection_info_path: "{{ artifacts_local_dir }}/{{ item }}/connection-info-{{ item }}.txt"
+      remote_profile_path: "{{ pivpn_profile_dir }}/{{ item }}.conf"
+  loop: "{{ vpn_users }}"
+  loop_control:
+    index_var: artifact_index
+  no_log: true
+
+# LOCAL ARTIFACT BLOCK
+# CREATES LOCAL PER-USER FOLDERS ON THE CONTROLLER, FETCHES THE GENERATED VPN PROFILE, AND RENDERS THE FINAL CONNECTION INFO FILE.
+- name: Ensure local artifact directories exist on the controller
+  ansible.builtin.file:
+    path: "{{ item.local_dir }}"
+    state: directory
+    mode: "0750"
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Fetch generated VPN profile files to the controller
+  ansible.builtin.fetch:
+    src: "{{ item.remote_profile_path }}"
+    dest: "{{ item.local_profile_path }}"
+    flat: true
+  loop: "{{ vpn_artifact_records }}"
+  no_log: true
+
+- name: Remove legacy SSH helper private keys from the controller artifacts
+  ansible.builtin.file:
+    path: "{{ item.local_dir }}/dcv-self-service-{{ item.user }}"
+    state: absent
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Remove legacy SSH helper public keys from the controller artifacts
+  ansible.builtin.file:
+    path: "{{ item.local_dir }}/dcv-self-service-{{ item.user }}.pub"
+    state: absent
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Render final connection info files on the controller
+  ansible.builtin.copy:
+    dest: "{{ item.local_connection_info_path }}"
+    mode: "0600"
+    content: |
+      PROJECT={{ project_name }}
+      USER={{ item.user }}
+      VPN_ENDPOINT={{ ansible_host }}
+      VPN_ENDPOINT_MODE={{ vpn_public_endpoint_mode }}
+      VPN_PRIVATE_IP={{ ansible_default_ipv4.address | default('unknown') }}
+      VPN_PORT=51820
+      DCV_HOST_NAME={{ item.dcv_host_name }}
+      DCV_PRIVATE_IP={{ item.dcv_private_ip }}
+      DCV_WEB_URL=https://{{ item.dcv_private_ip }}:8443
+      DCV_USERNAME={{ item.user }}
+      DCV_PASSWORD={{ item.dcv_password }}
+      DCV_PORT=8443
+      DCV_POWER_HELPER_URL=https://{{ ansible_default_ipv4.address | default('unknown') }}:{{ dcv_self_service_port }}/
+      DCV_POWER_HELPER_HOST={{ ansible_default_ipv4.address | default('unknown') }}
+      DCV_POWER_HELPER_PORT={{ dcv_self_service_port }}
+      DCV_POWER_HELPER_AUTH={{ item.user }} + YOUR DCV PASSWORD
+      DCV_POWER_BROWSER_FLOW=OPEN THE DCV_POWER_HELPER_URL IN A BROWSER AFTER CONNECTING TO THE VPN, ACCEPT THE SELF-SIGNED CERTIFICATE WARNING, AND SIGN IN WITH THE SAME DCV USERNAME AND PASSWORD.
+      DCV_POWER_STATUS_COMMAND=curl -ksS -u {{ item.user }}:'<YOUR_DCV_PASSWORD>' https://{{ ansible_default_ipv4.address | default('unknown') }}:{{ dcv_self_service_port }}/status
+      DCV_POWER_START_COMMAND=curl -ksS -u {{ item.user }}:'<YOUR_DCV_PASSWORD>' -X POST https://{{ ansible_default_ipv4.address | default('unknown') }}:{{ dcv_self_service_port }}/api/start
+      DCV_POWER_STOP_COMMAND=curl -ksS -u {{ item.user }}:'<YOUR_DCV_PASSWORD>' -X POST https://{{ ansible_default_ipv4.address | default('unknown') }}:{{ dcv_self_service_port }}/api/stop
+      S3_BUCKET={{ s3_bucket_name }}
+      NOTE=CONNECT TO THE VPN FIRST. THEN USE THE INTERNAL HTTPS SELF-SERVICE PAGE OR THE DCV_POWER_* CURL COMMANDS WITH THE SAME DCV USERNAME AND PASSWORD TO START OR STOP YOUR OWN DCV INSTANCE THROUGH THE ALWAYS-ON VPN SERVER.
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+# S3 UPLOAD BLOCK
+# UPLOADS THE VPN PROFILE AND FINAL CONNECTION INFO TO THE PER-USER FOLDER IN S3 USING THE LOCAL CONTROLLER AWS CREDENTIALS.
+- name: Upload VPN profile files to S3
+  amazon.aws.s3_object:
+    bucket: "{{ s3_bucket_name }}"
+    object: "{{ item.user }}/{{ item.user }}.conf"
+    src: "{{ item.local_profile_path }}"
+    mode: put
+    region: "{{ aws_region }}"
+    encrypt: true
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Upload final connection info files to S3
+  amazon.aws.s3_object:
+    bucket: "{{ s3_bucket_name }}"
+    object: "{{ item.user }}/connection-info-{{ item.user }}.txt"
+    src: "{{ item.local_connection_info_path }}"
+    mode: put
+    region: "{{ aws_region }}"
+    encrypt: true
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Remove legacy SSH helper private keys from S3
+  amazon.aws.s3_object:
+    bucket: "{{ s3_bucket_name }}"
+    object: "{{ item.user }}/dcv-self-service-{{ item.user }}"
+    mode: delobj
+    region: "{{ aws_region }}"
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true
+
+- name: Remove legacy SSH helper public keys from S3
+  amazon.aws.s3_object:
+    bucket: "{{ s3_bucket_name }}"
+    object: "{{ item.user }}/dcv-self-service-{{ item.user }}.pub"
+    mode: delobj
+    region: "{{ aws_region }}"
+  loop: "{{ vpn_artifact_records }}"
+  delegate_to: localhost
+  become: false
+  no_log: true

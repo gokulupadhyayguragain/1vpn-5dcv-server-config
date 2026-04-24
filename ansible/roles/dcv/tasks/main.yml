@@ -1,0 +1,817 @@
+---
+# USER MAPPING BLOCK
+# MAPS EACH PRIVATE DCV HOST TO ONE DEDICATED VPN USER AND PASSWORD FROM THE CONTROL .ENV FILE.
+- name: Derive dedicated DCV user credentials for this host
+  ansible.builtin.set_fact:
+    dcv_connection_username: "{{ vpn_users[groups.get('dcv', []).index(inventory_hostname)] }}"
+    dcv_connection_user_key_suffix: "{{ vpn_users[groups.get('dcv', []).index(inventory_hostname)] | regex_replace('[^A-Za-z0-9]', '_') | upper }}"
+    dcv_session_password: "{{ lookup('env', 'DCV_PASSWORD_' ~ (vpn_users[groups.get('dcv', []).index(inventory_hostname)] | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_legacy_session_password, true) }}"
+    dcv_user_sudo: "{{ (lookup('env', 'DCV_SUDO_' ~ (vpn_users[groups.get('dcv', []).index(inventory_hostname)] | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_default_user_sudo_raw, true)) | bool }}"
+  no_log: true
+
+# NETWORK IDENTITY BLOCK
+# PINS THE PRIVATE EC2 NIC NAME FROM FACTS SO REBOOTS KEEP USING SYSTEMD-NETWORKD EVEN AFTER FULL DESKTOP PACKAGES LAND.
+- name: Derive the primary private NIC name for this DCV host
+  ansible.builtin.set_fact:
+    dcv_primary_interface: "{{ ansible_default_ipv4.interface | default('ens5') }}"
+
+# NETWORK STABILITY BLOCK
+# WRITES A PERSISTENT NETPLAN RENDERER OVERRIDE AND AN EARLY BOOT GUARD SO UBUNTU DESKTOP CANNOT SILENTLY MOVE THE EC2 NIC TO NETWORKMANAGER.
+- name: Render persistent DCV netplan networkd override
+  ansible.builtin.copy:
+    dest: "{{ dcv_netplan_path }}"
+    mode: "0600"
+    content: |
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          {{ dcv_primary_interface }}:
+            dhcp4: true
+            dhcp6: false
+            optional: true
+
+- name: Render NetworkManager unmanaged override for the primary DCV NIC
+  ansible.builtin.copy:
+    dest: "{{ dcv_networkmanager_unmanaged_path }}"
+    mode: "0644"
+    content: |
+      [keyfile]
+      unmanaged-devices=interface-name:{{ dcv_primary_interface }}
+
+- name: Install DCV early network recovery guard script
+  ansible.builtin.copy:
+    dest: "{{ dcv_network_guard_script_path }}"
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # NETWORK RENDERER BLOCK
+      # REASSERTS SYSTEMD-NETWORKD FOR THE EC2 NIC SO DESKTOP PACKAGES CANNOT LEAVE THE PRIVATE HOST WITHOUT NETWORK AFTER A REBOOT.
+      mkdir -p /etc/netplan /etc/NetworkManager/conf.d
+      cat >{{ dcv_netplan_path }} <<'NETPLAN_EOF'
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          {{ dcv_primary_interface }}:
+            dhcp4: true
+            dhcp6: false
+            optional: true
+      NETPLAN_EOF
+
+      cat >{{ dcv_networkmanager_unmanaged_path }} <<'NETWORKMANAGER_EOF'
+      [keyfile]
+      unmanaged-devices=interface-name:{{ dcv_primary_interface }}
+      NETWORKMANAGER_EOF
+
+      systemctl unmask systemd-networkd.service 2>/dev/null || true
+      systemctl enable systemd-networkd.service 2>/dev/null || true
+      systemctl restart systemd-networkd.service 2>/dev/null || true
+      systemctl unmask systemd-resolved.service 2>/dev/null || true
+      systemctl enable systemd-resolved.service 2>/dev/null || true
+      systemctl restart systemd-resolved.service 2>/dev/null || true
+      systemctl stop systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl mask systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl stop NetworkManager.service 2>/dev/null || true
+      systemctl disable NetworkManager.service 2>/dev/null || true
+      systemctl mask NetworkManager.service 2>/dev/null || true
+      systemctl stop NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl mask NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl stop ModemManager.service 2>/dev/null || true
+      systemctl disable ModemManager.service 2>/dev/null || true
+      systemctl mask ModemManager.service 2>/dev/null || true
+
+      # SSH RECOVERY BLOCK
+      # KEEPS OPENSSH IN A PERSISTENT SERVICE MODE SO THE PRIVATE HOST CAN ACCEPT BASTION SSH AS SOON AS THE NIC COMES BACK.
+      systemctl stop ssh.socket 2>/dev/null || true
+      systemctl disable ssh.socket 2>/dev/null || true
+      systemctl mask ssh.socket 2>/dev/null || true
+      systemctl unmask ssh.service 2>/dev/null || true
+      systemctl enable ssh.service 2>/dev/null || true
+      systemctl restart ssh.service 2>/dev/null || true
+
+      netplan generate 2>/dev/null || true
+      netplan apply 2>/dev/null || true
+
+- name: Install DCV early network recovery guard service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/{{ dcv_network_guard_service_name }}
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=DCV EARLY NETWORK RECOVERY GUARD
+      Wants=cloud-final.service
+      After=cloud-final.service
+      Before=multi-user.target
+
+      [Service]
+      Type=oneshot
+      ExecStart={{ dcv_network_guard_script_path }}
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Reload systemd after installing the DCV early network recovery guard
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and run the DCV early network recovery guard
+  ansible.builtin.systemd:
+    name: "{{ dcv_network_guard_service_name }}"
+    enabled: true
+    state: started
+
+# DCV FIREWALL BLOCK
+# ALLOWS SSH FROM THE VPN BASTION PLUS VPN CLIENT CIDR, AND ALLOWS DCV ONLY FROM VPN CLIENT CIDR.
+- name: Allow SSH from VPN bastion subnet
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+    src: "{{ public_subnet_cidr }}"
+
+- name: Allow SSH from VPN client CIDR
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+    src: "{{ vpn_client_cidr }}"
+
+- name: Allow DCV TCP 8443 from VPN client CIDR
+  community.general.ufw:
+    rule: allow
+    port: "8443"
+    proto: tcp
+    src: "{{ vpn_client_cidr }}"
+
+# PRIVATE DCV EAST-WEST ACCESS BLOCK
+# ALLOWS PRIVATE-SUBNET TRAFFIC BETWEEN DCV HOSTS SO THEY CAN PING EACH OTHER AND SUPPORT INTERNAL SSH OR LATENCY TESTS.
+- name: Allow private-subnet east-west traffic between DCV hosts
+  community.general.ufw:
+    rule: allow
+    src: "{{ private_subnet_cidr }}"
+
+- name: Enable UFW on DCV host after SSH and DCV allow rules are in place
+  community.general.ufw:
+    state: enabled
+
+# SSH STABILITY BLOCK
+# APPLIES A PERSISTENT SSH SERVICE CONFIG BEFORE THE HEAVY DESKTOP BOOTSTRAP SO REBOOTS AND HIGH CONNECTION CHURN DO NOT LEAVE ONLY A FRAGILE SOCKET-ACTIVATED PATH.
+- name: Render SSH daemon stability override for DCV hosts
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/99-dcv-improvised.conf
+    mode: "0644"
+    content: |
+      MaxStartups 100:30:200
+      MaxSessions 100
+      LoginGraceTime 60
+      ClientAliveInterval 30
+      ClientAliveCountMax 10
+
+- name: Switch DCV hosts from SSH socket activation to a persistent SSH service
+  ansible.builtin.shell: |
+    set -euo pipefail
+    systemctl stop ssh.socket || true
+    systemctl disable ssh.socket || true
+    systemctl mask ssh.socket || true
+    systemctl unmask ssh.service || true
+    systemctl enable ssh.service
+    systemctl restart ssh.service
+  args:
+    executable: /bin/bash
+
+- name: Reset the Ansible SSH connection after DCV SSH service changes
+  ansible.builtin.meta: reset_connection
+
+- name: Wait for the DCV SSH service to come back after the service-mode switch
+  ansible.builtin.wait_for_connection:
+    timeout: 120
+    connect_timeout: 10
+    sleep: 5
+
+# POST-BOOT GUARD BLOCK
+# INSTALLS A BOOT-TIME RECOVERY GUARD BEFORE THE LONG DESKTOP PHASE SO EARLY REBOOTS STILL REASSERT SSH, GDM3, AND DCV WHEN THOSE COMPONENTS EXIST.
+- name: Install DCV post-boot recovery guard script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/dcv-postboot-guard.sh
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # SERVICE RECOVERY BLOCK
+      # REAPPLIES THE STABLE SERVICE MODELS THAT THIS REPO RELIES ON AFTER PACKAGE UPGRADES OR GUEST REBOOTS.
+      systemctl stop ssh.socket 2>/dev/null || true
+      systemctl disable ssh.socket 2>/dev/null || true
+      systemctl mask ssh.socket 2>/dev/null || true
+      systemctl unmask ssh.service 2>/dev/null || true
+      systemctl enable ssh.service 2>/dev/null || true
+      systemctl restart ssh.service 2>/dev/null || true
+      systemctl stop systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl mask systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl stop NetworkManager.service 2>/dev/null || true
+      systemctl disable NetworkManager.service 2>/dev/null || true
+      systemctl mask NetworkManager.service 2>/dev/null || true
+      systemctl stop NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl mask NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl stop ModemManager.service 2>/dev/null || true
+      systemctl disable ModemManager.service 2>/dev/null || true
+      systemctl mask ModemManager.service 2>/dev/null || true
+
+      # DESKTOP RECOVERY BLOCK
+      # ONLY TOUCHES GDM3 OR DCV WHEN THOSE PACKAGES ARE PRESENT SO THE GUARD IS SAFE BOTH BEFORE AND AFTER THE DESKTOP INSTALL.
+      if systemctl list-unit-files | grep -q '^gdm3\.service'; then
+        systemctl unmask gdm3.service 2>/dev/null || true
+        systemctl enable gdm3.service 2>/dev/null || true
+        systemctl start gdm3.service 2>/dev/null || true
+      fi
+
+      if systemctl list-unit-files | grep -q '^dcvserver\.service'; then
+        systemctl unmask dcvserver.service 2>/dev/null || true
+        systemctl enable dcvserver.service 2>/dev/null || true
+        systemctl restart dcvserver.service 2>/dev/null || true
+      fi
+
+      # SESSION RECOVERY BLOCK
+      # RECREATES THE DEFAULT DCV SESSION ONLY WHEN DCV AND THE DEDICATED USER ALREADY EXIST.
+      if command -v dcv >/dev/null 2>&1 && id -u {{ dcv_connection_username | quote }} >/dev/null 2>&1; then
+        if ! dcv describe-session default >/dev/null 2>&1; then
+          dcv create-session default --owner {{ dcv_connection_username | quote }} --type virtual || true
+        fi
+      fi
+
+- name: Install DCV post-boot recovery guard service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dcv-postboot-guard.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=DCV POST-BOOT RECOVERY GUARD
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/dcv-postboot-guard.sh
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Reload systemd after installing the DCV post-boot recovery guard
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and run the DCV post-boot recovery guard
+  ansible.builtin.systemd:
+    name: dcv-postboot-guard.service
+    enabled: true
+    state: started
+
+# SWAP PREP BLOCK
+# ADDS SAFETY MARGIN SO FULL UBUNTU DESKTOP INSTALLS DO NOT EXHAUST MEMORY ON SMALLER INSTANCE TYPES.
+- name: Check whether the DCV swap file is already active
+  ansible.builtin.command: "swapon --show=NAME --noheadings"
+  register: dcv_active_swaps
+  changed_when: false
+
+- name: Create DCV swap file when missing
+  ansible.builtin.command: "fallocate -l {{ dcv_swap_size_gb }}G /swapfile"
+  args:
+    creates: /swapfile
+  when: dcv_swap_size_gb | int > 0
+
+- name: Lock down DCV swap file permissions
+  ansible.builtin.file:
+    path: /swapfile
+    owner: root
+    group: root
+    mode: "0600"
+  when: dcv_swap_size_gb | int > 0
+
+- name: Format DCV swap file
+  ansible.builtin.command: "mkswap /swapfile"
+  when:
+    - dcv_swap_size_gb | int > 0
+    - "'/swapfile' not in (dcv_active_swaps.stdout_lines | default([]))"
+
+- name: Persist DCV swap file in fstab
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^/swapfile\s+'
+    line: '/swapfile none swap sw 0 0'
+  when: dcv_swap_size_gb | int > 0
+
+- name: Enable DCV swap file
+  ansible.builtin.command: "swapon /swapfile"
+  when:
+    - dcv_swap_size_gb | int > 0
+    - "'/swapfile' not in (dcv_active_swaps.stdout_lines | default([]))"
+
+# BOOTSTRAP ORCHESTRATION BLOCK
+# STAGES THE LONG GNOME INSTALL AS A HOST-LOCAL JOB SO SSH RECONNECTS DO NOT RUIN THE FULL CONFIGURATION FLOW.
+- name: Run the desktop bootstrap flow
+  ansible.builtin.import_tasks: bootstrap.yml
+
+# DEV TOOLCHAIN BLOCK
+# INSTALLS THE REQUESTED DEV TOOLS ON FIRST BUILD SO A GOLDEN AMI CAN BE CREATED AND REUSED BY SPOT REPLACEMENTS.
+- name: Install baseline package dependencies for developer tooling
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - git
+      - gnupg
+      - libnotify-bin
+      - software-properties-common
+      - wget
+      - xfsprogs
+    state: present
+  when: dcv_install_dev_toolchain
+
+- name: Remove Firefox package in favor of Chrome
+  ansible.builtin.apt:
+    name: firefox
+    state: absent
+    purge: true
+  failed_when: false
+  when: dcv_install_dev_toolchain
+
+- name: Download Google Chrome package
+  ansible.builtin.get_url:
+    url: https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+    dest: /tmp/google-chrome-stable_current_amd64.deb
+    mode: "0644"
+  when: dcv_install_dev_toolchain
+
+- name: Install Google Chrome
+  ansible.builtin.apt:
+    deb: /tmp/google-chrome-stable_current_amd64.deb
+  when: dcv_install_dev_toolchain
+
+- name: Download Visual Studio Code package
+  ansible.builtin.get_url:
+    url: https://update.code.visualstudio.com/latest/linux-deb-x64/stable
+    dest: /tmp/code_latest_amd64.deb
+    mode: "0644"
+  when: dcv_install_dev_toolchain
+
+- name: Install Visual Studio Code
+  ansible.builtin.apt:
+    deb: /tmp/code_latest_amd64.deb
+  when: dcv_install_dev_toolchain
+
+- name: Install Docker engine package
+  ansible.builtin.apt:
+    name:
+      - docker.io
+    state: present
+  when: dcv_install_dev_toolchain
+
+- name: Enable and start Docker service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+  when: dcv_install_dev_toolchain
+
+- name: Ensure Flutter install parent directory exists
+  ansible.builtin.file:
+    path: "{{ dcv_flutter_install_dir | dirname }}"
+    state: directory
+    mode: "0755"
+  when: dcv_install_dev_toolchain
+
+- name: Install or update Flutter stable SDK
+  ansible.builtin.git:
+    repo: https://github.com/flutter/flutter.git
+    dest: "{{ dcv_flutter_install_dir }}"
+    version: stable
+    depth: 1
+    update: true
+  when: dcv_install_dev_toolchain
+
+- name: Export Flutter path system-wide
+  ansible.builtin.copy:
+    dest: /etc/profile.d/flutter.sh
+    mode: "0644"
+    content: |
+      export PATH={{ dcv_flutter_install_dir }}/bin:$PATH
+  when: dcv_install_dev_toolchain
+
+- name: Disable Flutter analytics globally
+  ansible.builtin.command: "{{ dcv_flutter_install_dir }}/bin/flutter config --no-analytics"
+  changed_when: false
+  when: dcv_install_dev_toolchain
+
+# SCALING NOTE BLOCK
+# KEEPS THE FULL UBUNTU GNOME DESKTOP PLUS GDM3 ON EVERY DCV HOST WHILE LEAVING THE EC2 SERVER NIC ON NETWORKD FOR STABLE PRIVATE-SUBNET REACHABILITY.
+- name: Disable Wayland for GDM3
+  ansible.builtin.lineinfile:
+    path: /etc/gdm3/custom.conf
+    regexp: '^#?WaylandEnable='
+    line: 'WaylandEnable=false'
+    insertafter: '^\[daemon\]'
+  register: dcv_wayland_config
+
+- name: Restart GDM3 when Wayland configuration changes
+  ansible.builtin.systemd:
+    name: gdm3
+    state: restarted
+  when: dcv_wayland_config.changed
+
+- name: Enable GDM3 service
+  ansible.builtin.systemd:
+    name: gdm3
+    enabled: true
+    state: started
+
+- name: Restore the default target to graphical after desktop install completes
+  ansible.builtin.command: systemctl set-default graphical.target
+  changed_when: false
+
+# DCV INSTALL BLOCK
+# DOWNLOADS AND INSTALLS NICE DCV SERVER PACKAGE FOR UBUNTU 24.04.
+- name: Download NICE DCV package archive
+  ansible.builtin.get_url:
+    url: "{{ dcv_package_url }}"
+    dest: "{{ dcv_package_archive }}"
+    mode: "0644"
+
+- name: Reset extraction directory
+  ansible.builtin.file:
+    path: "{{ dcv_extract_dir }}"
+    state: absent
+
+- name: Create extraction directory
+  ansible.builtin.file:
+    path: "{{ dcv_extract_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Extract NICE DCV package archive
+  ansible.builtin.unarchive:
+    src: "{{ dcv_package_archive }}"
+    dest: "{{ dcv_extract_dir }}"
+    remote_src: true
+
+# PACKAGE DISCOVERY BLOCK
+# FINDS THE EXTRACTED DCV .DEB FILES RELIABLY EVEN WHEN THE ARCHIVE EXPANDS INTO A VERSIONED SUBDIRECTORY.
+- name: Discover extracted NICE DCV packages
+  ansible.builtin.find:
+    paths: "{{ dcv_extract_dir }}"
+    patterns: "*.deb"
+    recurse: true
+    file_type: file
+  register: dcv_package_debs
+
+- name: Fail when no NICE DCV packages were found after extraction
+  ansible.builtin.assert:
+    that:
+      - dcv_package_debs.matched | int > 0
+    fail_msg: "NO NICE DCV .DEB PACKAGES WERE FOUND UNDER {{ dcv_extract_dir }} AFTER EXTRACTION."
+
+- name: Install NICE DCV server packages
+  ansible.builtin.apt:
+    deb: "{{ item.path }}"
+  loop: "{{ dcv_package_debs.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+# DCV CONFIG BLOCK
+# ENABLES WEBSOCKET TRANSPORT AND SETS EXPLICIT LISTEN PORT.
+- name: Ensure dcv.conf directory exists
+  ansible.builtin.file:
+    path: /etc/dcv
+    state: directory
+    mode: "0755"
+
+- name: Configure NICE DCV server settings
+  ansible.builtin.copy:
+    dest: /etc/dcv/dcv.conf
+    mode: "0644"
+    content: |
+      [connectivity]
+      web-port=8443
+
+      [security]
+      authentication="system"
+
+- name: Ensure dedicated DCV login user exists
+  ansible.builtin.user:
+    name: "{{ dcv_connection_username }}"
+    shell: /bin/bash
+    create_home: true
+    groups: "{{ 'sudo' if dcv_user_sudo else omit }}"
+    append: "{{ dcv_user_sudo }}"
+
+- name: Set dedicated DCV login password
+  ansible.builtin.shell: |
+    cat <<'CHPASSWD_EOF' | chpasswd
+    {{ dcv_connection_username }}:{{ dcv_session_password }}
+    CHPASSWD_EOF
+  args:
+    executable: /bin/bash
+  register: dcv_password_update
+  changed_when: dcv_password_update.rc == 0
+
+- name: Report whether the dedicated DCV user can use sudo
+  ansible.builtin.debug:
+    msg: "DEDICATED DCV USER {{ dcv_connection_username }} SUDO ACCESS IS {{ 'ENABLED' if dcv_user_sudo else 'DISABLED' }}."
+
+- name: Add the dedicated DCV user to the docker group
+  ansible.builtin.user:
+    name: "{{ dcv_connection_username }}"
+    groups: docker
+    append: true
+  when: dcv_install_dev_toolchain
+
+- name: Ensure DCV connectivity config section exists
+  ansible.builtin.lineinfile:
+    path: /etc/dcv/dcv.conf
+    regexp: '^\[connectivity\]$'
+    line: '[connectivity]'
+    create: true
+    mode: "0644"
+
+- name: Configure DCV idle client disconnect timeout
+  ansible.builtin.lineinfile:
+    path: /etc/dcv/dcv.conf
+    regexp: '^\s*#?\s*idle-timeout\s*='
+    line: "idle-timeout={{ dcv_idle_timeout_minutes }}"
+    insertafter: '^\[connectivity\]$'
+  register: dcv_idle_timeout_config
+
+- name: Configure DCV idle timeout warning
+  ansible.builtin.lineinfile:
+    path: /etc/dcv/dcv.conf
+    regexp: '^\s*#?\s*idle-timeout-warning\s*='
+    line: "idle-timeout-warning={{ dcv_idle_timeout_warning_seconds }}"
+    insertafter: '^\[connectivity\]$'
+  register: dcv_idle_timeout_warning_config
+
+- name: Enable and start dcvserver service
+  ansible.builtin.systemd:
+    name: dcvserver
+    enabled: true
+    state: started
+
+- name: Restart dcvserver when idle timeout configuration changes
+  ansible.builtin.systemd:
+    name: dcvserver
+    state: restarted
+  when: dcv_idle_timeout_config.changed or dcv_idle_timeout_warning_config.changed
+
+- name: Ensure default DCV session exists
+  ansible.builtin.command: "dcv create-session default --owner {{ dcv_connection_username }} --type virtual"
+  register: dcv_create_session
+  failed_when: dcv_create_session.rc != 0 and ('already exists' not in (((dcv_create_session.stderr | default('')) ~ (dcv_create_session.stdout | default(''))) | lower))
+  changed_when: "'already exists' not in (((dcv_create_session.stderr | default('')) ~ (dcv_create_session.stdout | default(''))) | lower)"
+
+# DCV IDLE STOP BLOCK
+# STOPS THE EC2 INSTANCE AFTER DCV HAS DISCONNECTED AN IDLE CLIENT AND THE SESSION HAS NO ACTIVE CONNECTIONS.
+- name: Install DCV idle stop watcher script
+  ansible.builtin.copy:
+    dest: /usr/local/bin/dcv-idle-stop-watch
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      SESSION_ID="default"
+      STOP_AFTER_DISCONNECT_SECONDS={{ dcv_stop_after_idle_disconnect_seconds }}
+      STATE_DIR="/var/lib/dcv-idle-stop"
+      NO_CONNECTION_SINCE_FILE="$STATE_DIR/no_connection_since"
+
+      mkdir -p "$STATE_DIR"
+
+      session_json="$(dcv describe-session "$SESSION_ID" -j 2>/dev/null || true)"
+      if [[ -z "$session_json" ]]; then
+        logger -t dcv-idle-stop "ACTION=skip REASON=missing-session SESSION=$SESSION_ID"
+        exit 0
+      fi
+
+      session_state="$(SESSION_JSON="$session_json" python3 - <<'PY'
+      import datetime
+      import json
+      import os
+
+      payload = json.loads(os.environ["SESSION_JSON"])
+      connections = int(payload.get("num-of-connections") or 0)
+      last_disconnection = payload.get("last-disconnection-time") or ""
+
+      epoch = ""
+      if last_disconnection:
+          try:
+              parsed = datetime.datetime.fromisoformat(last_disconnection.replace("Z", "+00:00"))
+              epoch = str(int(parsed.timestamp()))
+          except ValueError:
+              epoch = ""
+
+      print(f"{connections} {epoch}")
+      PY
+      )"
+
+      read -r connection_count last_disconnection_epoch <<<"$session_state"
+      now_epoch="$(date +%s)"
+
+      if (( connection_count > 0 )); then
+        rm -f "$NO_CONNECTION_SINCE_FILE"
+        logger -t dcv-idle-stop "ACTION=active CONNECTIONS=$connection_count"
+        exit 0
+      fi
+
+      if [[ -n "${last_disconnection_epoch:-}" ]]; then
+        no_connection_since="$last_disconnection_epoch"
+        printf '%s\n' "$no_connection_since" >"$NO_CONNECTION_SINCE_FILE"
+      elif [[ -f "$NO_CONNECTION_SINCE_FILE" ]]; then
+        no_connection_since="$(cat "$NO_CONNECTION_SINCE_FILE" 2>/dev/null || printf '%s' "$now_epoch")"
+      else
+        no_connection_since="$now_epoch"
+        printf '%s\n' "$no_connection_since" >"$NO_CONNECTION_SINCE_FILE"
+      fi
+
+      if ! [[ "$no_connection_since" =~ ^[0-9]+$ ]]; then
+        no_connection_since="$now_epoch"
+        printf '%s\n' "$no_connection_since" >"$NO_CONNECTION_SINCE_FILE"
+      fi
+
+      idle_seconds="$((now_epoch - no_connection_since))"
+      if (( idle_seconds >= STOP_AFTER_DISCONNECT_SECONDS )); then
+        logger -t dcv-idle-stop "ACTION=stop REASON=no-dcv-connections IDLE_SECONDS=$idle_seconds"
+        shutdown -h now "Stopping EC2 instance after DCV idle timeout"
+      else
+        logger -t dcv-idle-stop "ACTION=grace CONNECTIONS=0 REMAINING_SECONDS=$((STOP_AFTER_DISCONNECT_SECONDS - idle_seconds))"
+      fi
+
+- name: Install DCV idle stop watcher systemd service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dcv-idle-stop-watch.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Stop EC2 after DCV idle disconnect
+      Wants=dcvserver.service
+      After=dcvserver.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/dcv-idle-stop-watch
+
+- name: Install DCV idle stop watcher systemd timer
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dcv-idle-stop-watch.timer
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Run DCV idle stop watcher every minute
+
+      [Timer]
+      OnBootSec=3min
+      OnUnitActiveSec=1min
+      AccuracySec=10s
+      Unit=dcv-idle-stop-watch.service
+
+      [Install]
+      WantedBy=timers.target
+
+- name: Enable DCV idle stop watcher timer
+  ansible.builtin.systemd:
+    name: dcv-idle-stop-watch.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# SPOT INTERRUPTION WARNING BLOCK
+# NOTIFIES LOGGED-IN USERS INSIDE UBUNTU WHEN AWS SPOT INTERRUPTION NOTICE APPEARS, THEN LEAVES A WALL WARNING FOR ALL TTY SESSIONS.
+- name: Install Spot interruption watcher script on DCV host
+  ansible.builtin.copy:
+    dest: /usr/local/bin/dcv-spot-interruption-watch
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      POLL_SECONDS={{ dcv_spot_imds_poll_seconds }}
+      STATE_FILE=/run/dcv-spot-warning-sent
+
+      get_imds_token() {
+        curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true
+      }
+
+      read_instance_action() {
+        local token="$1"
+        if [[ -z "$token" ]]; then
+          return 1
+        fi
+
+        curl -fsS \
+          -H "X-aws-ec2-metadata-token: ${token}" \
+          "http://169.254.169.254/latest/meta-data/spot/instance-action" || true
+      }
+
+      notify_logged_users() {
+        local message="$1"
+        wall "$message" || true
+
+        while read -r logged_user; do
+          [[ -z "$logged_user" ]] && continue
+          user_uid="$(id -u "$logged_user" 2>/dev/null || true)"
+          [[ -z "$user_uid" ]] && continue
+
+          if [[ -S "/run/user/${user_uid}/bus" ]]; then
+            sudo -u "$logged_user" \
+              DISPLAY=:0 \
+              DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${user_uid}/bus" \
+              notify-send "⚠️ Spot interruption warning" "$message" || true
+          fi
+        done < <(who | awk '{print $1}' | sort -u)
+      }
+
+      current_token="$(get_imds_token)"
+      while true; do
+        action_payload="$(read_instance_action "$current_token")"
+        if [[ -z "$action_payload" ]]; then
+          rm -f "$STATE_FILE"
+          sleep "$POLL_SECONDS"
+          continue
+        fi
+
+        if [[ ! -f "$STATE_FILE" ]]; then
+          warning_message="AWS Spot interruption received on $(hostname -f). This instance can terminate in about 2 minutes. Save work now."
+          logger -t dcv-spot-watch "$warning_message"
+          notify_logged_users "$warning_message"
+          touch "$STATE_FILE"
+        fi
+
+        sleep "$POLL_SECONDS"
+      done
+
+- name: Install Spot interruption watcher systemd service on DCV host
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dcv-spot-interruption-watch.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=DCV Spot interruption warning watcher
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/dcv-spot-interruption-watch
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable Spot interruption watcher service on DCV host
+  ansible.builtin.systemd:
+    name: dcv-spot-interruption-watch.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# FAIL2BAN HARDENING BLOCK
+# ENABLES FAIL2BAN ONLY AFTER THE PRIVATE HOST CAN ACCEPT SSH FROM THE BASTION AND VPN CLIENTS SO PROVISIONING DOES NOT SELF-BLOCK.
+- name: Ensure fail2ban drop-in directory exists on DCV hosts
+  ansible.builtin.file:
+    path: /etc/fail2ban/jail.d
+    state: directory
+    mode: "0755"
+
+- name: Render DCV fail2ban SSH jail override
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/dcv-improvised-sshd.local
+    mode: "0644"
+    content: |
+      [DEFAULT]
+      ignoreip = 127.0.0.1/8 ::1 {{ public_subnet_cidr }} {{ private_subnet_cidr }} {{ vpn_client_cidr }}
+      bantime = 10m
+      findtime = 10m
+      maxretry = 10
+
+      [sshd]
+      enabled = true
+
+- name: Install fail2ban on DCV hosts without auto-starting default jails
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+    policy_rc_d: 101
+
+- name: Enable and start fail2ban on DCV hosts after jail overrides are present
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: true
+    state: started

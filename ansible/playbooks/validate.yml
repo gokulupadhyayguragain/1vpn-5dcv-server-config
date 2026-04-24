@@ -1,0 +1,200 @@
+---
+# CONNECTIVITY VALIDATION BLOCK
+# VERIFIES HOST REACHABILITY AND PRIVATE HOST INTERNET EGRESS.
+- name: Validate connectivity baseline
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Ping each host
+      ansible.builtin.ping:
+
+- name: Validate VPN service readiness
+  hosts: vpn
+  become: true
+  tasks:
+    - name: Verify WireGuard configuration file exists
+      ansible.builtin.stat:
+        path: /etc/wireguard/wg0.conf
+      register: vpn_wg0_conf
+
+    - name: Fail when WireGuard configuration is missing
+      ansible.builtin.assert:
+        that:
+          - vpn_wg0_conf.stat.exists
+        fail_msg: "PiVPN did not create /etc/wireguard/wg0.conf"
+
+    - name: Verify WireGuard service is active
+      ansible.builtin.command: systemctl is-active wg-quick@wg0
+      changed_when: false
+
+    - name: Verify the DCV instance control helper exists on the VPN host
+      ansible.builtin.stat:
+        path: /usr/local/bin/dcv-instance-control
+      register: vpn_dcv_instance_control_helper
+
+    - name: Assert the DCV instance control helper is installed on the VPN host
+      ansible.builtin.assert:
+        that:
+          - vpn_dcv_instance_control_helper.stat.exists
+        fail_msg: "DCV INSTANCE CONTROL HELPER IS NOT INSTALLED ON THE VPN HOST."
+
+    - name: Verify the DCV self-service HTTPS service is active
+      ansible.builtin.command: systemctl is-active dcv-self-service.service
+      changed_when: false
+
+    - name: Verify the VPN helper can resolve the first DCV user mapping
+      ansible.builtin.command: /usr/local/bin/dcv-instance-control --admin status {{ vpn_users[0] }}
+      changed_when: false
+      when: vpn_users | length > 0
+
+    - name: Verify the keyless self-service HTTPS endpoint answers for the first VPN user
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -ksSf
+          - -u
+          - "{{ vpn_users[0] }}:{{ lookup('env', 'DCV_PASSWORD_' ~ (vpn_users[0] | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_legacy_session_password, true) }}"
+          - "https://{{ ansible_default_ipv4.address | default('127.0.0.1') }}:{{ dcv_self_service_port }}/status"
+      register: vpn_dcv_self_service_status
+      changed_when: false
+      when: vpn_users | length > 0
+      no_log: true
+
+    - name: Assert the keyless self-service HTTPS response contains the first VPN user
+      ansible.builtin.assert:
+        that:
+          - "'\"user\": \"' ~ vpn_users[0] ~ '\"' in vpn_dcv_self_service_status.stdout"
+        fail_msg: "THE VPN-ONLY KEYLESS DCV SELF-SERVICE HTTPS ENDPOINT DID NOT RETURN THE EXPECTED USER MAPPING."
+      when: vpn_users | length > 0
+      no_log: true
+
+- name: Validate DCV private egress
+  hosts: dcv
+  become: true
+  tasks:
+    - name: Check whether the DCV desktop bootstrap finished
+      ansible.builtin.stat:
+        path: /var/lib/dcv-bootstrap/desktop.done
+      register: dcv_bootstrap_done
+
+    - name: Check the current DCV desktop bootstrap service state
+      ansible.builtin.command: systemctl is-active dcv-desktop-bootstrap.service
+      register: dcv_bootstrap_service_state
+      changed_when: false
+      failed_when: false
+
+    - name: Fail early when the DCV desktop bootstrap is still running
+      ansible.builtin.assert:
+        that:
+          - dcv_bootstrap_done.stat.exists
+        fail_msg: "DCV DESKTOP BOOTSTRAP IS NOT FINISHED YET. CURRENT BOOTSTRAP SERVICE STATE={{ dcv_bootstrap_service_state.stdout | default('unknown') }}. WAIT FOR THE CURRENT BUILD TO FINISH, OR USE START.SH OPTION L TO VIEW /var/log/dcv-desktop-bootstrap.log."
+
+    - name: Verify SSH service is enabled for reboot recovery
+      ansible.builtin.command: systemctl is-enabled ssh.service
+      changed_when: false
+
+    - name: Verify DCV early network recovery guard is enabled
+      ansible.builtin.command: systemctl is-enabled dcv-network-guard.service
+      changed_when: false
+
+    - name: Verify systemd-networkd is enabled for the private NIC
+      ansible.builtin.command: systemctl is-enabled systemd-networkd.service
+      changed_when: false
+
+    - name: Verify SSH socket activation is masked on DCV hosts
+      ansible.builtin.command: systemctl is-enabled ssh.socket
+      register: dcv_ssh_socket_state
+      changed_when: false
+      failed_when: false
+
+    - name: Assert SSH socket activation stays disabled on DCV hosts
+      ansible.builtin.assert:
+        that:
+          - "'masked' in dcv_ssh_socket_state.stdout or 'disabled' in dcv_ssh_socket_state.stdout"
+        fail_msg: "SSH SOCKET ACTIVATION IS STILL ENABLED ON THIS DCV HOST."
+
+    - name: Verify GDM3 service is enabled for desktop recovery
+      ansible.builtin.command: systemctl is-enabled gdm3
+      changed_when: false
+
+    - name: Verify dcvserver service is active
+      ansible.builtin.command: systemctl is-active dcvserver
+      changed_when: false
+
+    - name: Verify dcvserver service is enabled for reboot recovery
+      ansible.builtin.command: systemctl is-enabled dcvserver
+      changed_when: false
+
+    - name: Verify the DCV post-boot recovery guard is enabled
+      ansible.builtin.command: systemctl is-enabled dcv-postboot-guard.service
+      changed_when: false
+
+    - name: Verify the default DCV session exists after service startup
+      ansible.builtin.command: dcv describe-session default
+      changed_when: false
+
+    - name: Check internet access from private DCV host
+      ansible.builtin.command: curl -sSfL https://ifconfig.me
+      changed_when: false
+
+# SECURITY VALIDATION BLOCK
+# RUNS QUICK AUDIT COMMANDS TO SPOT HARDENING GAPS EARLY.
+- name: Validate security tooling
+  hosts: all
+  become: true
+  tasks:
+    - name: Verify lynis binary exists
+      ansible.builtin.shell: command -v lynis
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Verify fail2ban is responsive
+      ansible.builtin.command: fail2ban-client ping
+      changed_when: false
+
+# FIREWALL VALIDATION BLOCK
+# VERIFIES THE VPN HOST KEEPS ITS NAT RULES WITH NETFILTER-PERSISTENT WHILE PRIVATE DCV HOSTS KEEP UFW ACTIVE.
+- name: Validate VPN firewall persistence
+  hosts: vpn
+  become: true
+  tasks:
+    - name: Verify netfilter-persistent service is active
+      ansible.builtin.command: systemctl is-active netfilter-persistent
+      changed_when: false
+
+    - name: Verify private subnet NAT masquerade rule is present
+      ansible.builtin.command: iptables -t nat -C POSTROUTING -s {{ private_subnet_cidr }} -o {{ ansible_default_ipv4.interface | default('eth0') }} -j MASQUERADE
+      changed_when: false
+
+    - name: Verify VPN client VPC NAT bypass rule is present
+      ansible.builtin.command: iptables -t nat -C POSTROUTING -s {{ vpn_client_cidr }} -d {{ vpc_cidr }} -o {{ ansible_default_ipv4.interface | default('eth0') }} -j RETURN
+      changed_when: false
+
+    - name: Verify VPN client NAT masquerade rule is present
+      ansible.builtin.command: iptables -t nat -C POSTROUTING -s {{ vpn_client_cidr }} -o {{ ansible_default_ipv4.interface | default('eth0') }} -j MASQUERADE
+      changed_when: false
+
+- name: Validate DCV firewall policy
+  hosts: dcv
+  become: true
+  tasks:
+    - name: Verify UFW is enabled
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+
+    - name: Assert UFW reports an active status
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_status.stdout"
+        fail_msg: "UFW is not active on this host"
+
+    - name: Select a peer DCV host for east-west connectivity validation
+      ansible.builtin.set_fact:
+        dcv_peer_host: "{{ (groups.get('dcv', []) | difference([inventory_hostname]) | first) | default('', true) }}"
+
+    - name: Verify east-west ICMP reachability between DCV hosts
+      ansible.builtin.command: ping -c 2 -W 2 {{ hostvars[dcv_peer_host].ansible_host }}
+      changed_when: false
+      when: dcv_peer_host != ""

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_NAME="{{ project_name }}"
+ACTIVE_SECONDS="{{ dcv_vpn_active_seconds }}"
+DISCONNECT_GRACE_SECONDS="{{ dcv_disconnect_grace_seconds }}"
+STATE_DIR="/var/lib/dcv-vpn-watch"
+PROFILE_DIR="{{ pivpn_profile_dir }}"
+WG_INTERFACE="wg0"
+CONTROL_HELPER="/usr/local/bin/dcv-instance-control"
+
+mkdir -p "$STATE_DIR"
+
+now_epoch="$(date +%s)"
+wg_output="$(wg show "$WG_INTERFACE" latest-handshakes 2>/dev/null || true)"
+
+get_latest_handshake() {
+  local peer_public_key="$1"
+  awk -v key="$peer_public_key" '$1 == key { print $2 }' <<<"$wg_output"
+}
+
+get_instance_state() {
+  local user="$1"
+  "$CONTROL_HELPER" --admin status "$user" 2>/dev/null | awk -F= '$1 == "STATE" { print $2 }'
+}
+
+for user in {% for user in vpn_users %}{{ user | quote }}{% if not loop.last %} {% endif %}{% endfor %}; do
+  profile_path="$PROFILE_DIR/${user}.conf"
+  if [[ ! -f "$profile_path" ]]; then
+    logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=skip REASON=missing-profile"
+    continue
+  fi
+
+  private_key="$(awk -F'= ' '$1 == "PrivateKey " { print $2; exit }' "$profile_path")"
+  if [[ -z "${private_key:-}" ]]; then
+    logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=skip REASON=missing-private-key"
+    continue
+  fi
+
+  peer_public_key="$(printf '%s\n' "$private_key" | wg pubkey)"
+  latest_handshake="$(get_latest_handshake "$peer_public_key")"
+  latest_handshake="${latest_handshake:-0}"
+  last_active_file="$STATE_DIR/${user}.last_active"
+
+  if (( latest_handshake > 0 && now_epoch - latest_handshake <= ACTIVE_SECONDS )); then
+    printf '%s\n' "$now_epoch" >"$last_active_file"
+    instance_state="$(get_instance_state "$user" || true)"
+    if [[ "$instance_state" == "stopped" ]]; then
+      logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=start REASON=active-vpn-peer"
+      "$CONTROL_HELPER" --admin start "$user" >/dev/null
+    else
+      logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=active STATE=${instance_state:-unknown}"
+    fi
+    continue
+  fi
+
+  if [[ ! -f "$last_active_file" ]]; then
+    logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=skip REASON=never-active"
+    continue
+  fi
+
+  last_active_epoch="$(cat "$last_active_file" 2>/dev/null || printf '0')"
+  if ! [[ "$last_active_epoch" =~ ^[0-9]+$ ]]; then
+    last_active_epoch=0
+  fi
+
+  if (( now_epoch - last_active_epoch >= DISCONNECT_GRACE_SECONDS )); then
+    instance_state="$(get_instance_state "$user" || true)"
+    if [[ "$instance_state" == "running" || "$instance_state" == "pending" ]]; then
+      logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=stop REASON=inactive-vpn-peer GRACE_SECONDS=$DISCONNECT_GRACE_SECONDS"
+      "$CONTROL_HELPER" --admin stop "$user" >/dev/null
+    else
+      logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=inactive STATE=${instance_state:-unknown}"
+    fi
+  else
+    logger -t dcv-vpn-watch "PROJECT=$PROJECT_NAME USER=$user ACTION=grace REMAINING_SECONDS=$((DISCONNECT_GRACE_SECONDS - (now_epoch - last_active_epoch)))"
+  fi
+done

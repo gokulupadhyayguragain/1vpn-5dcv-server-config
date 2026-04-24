@@ -1,0 +1,69 @@
+1. architecture
+    1 vpn server = pi vpn on ec2 instance running ubuntu latest 24.*
+    x numbers of instances on private subnet, running dcv server
+
+2. configuration
+    use ansible for configuration management, installing things, copnfiguring files, and packages
+    testing connectiings , checking bugs, security and vulnerability checkings
+
+3. conection files
+    in a s3 bucket, the terraform will be running and it will upload the connection vpn files and connection infos for different x users in different folders
+    which i will download and test manual connect
+    terraform state file and credentials on same bucket
+    user*.conf and connection-info-user*.txt files for quick import and connect infos
+
+4. automation
+    for infra = use terraform
+    for config = use ansible
+
+5. security
+    define every single configurable variable things in .env file, that will be the central variables, keys, controlling hub
+    e.g. aws keys, no of instances, type: like t2.micro, storage etc. but dont use anything extra
+    use principle of least privilage
+
+6. access
+    public subnet = vpn server, also work as nat instance, intsrnet should be accessible after connecting to the vpn server
+    private subnet = not publicly accessible but should be ssh after connecting to vpn
+    after connecting the dcv server through dcv client in my local .. i should be able to access the internet from the dcv server .. connected from dcv client from my pc only after connecting to vpn
+
+7. documentation
+    do a good manual, document everything clean documentation
+
+8. clean code
+    do clean coding , proper scripts, follow the best practices of clean code and do good commenting .. do 2 comments in ucases, all comments in ucase,
+    1 what the code block is about, 2. what is it for what does it do or why, 
+
+9. control
+    controlling scripts: there are three scripts in root folder: create, destroy, check = for creating everything run independently, destroy created , destroy everything, check if everything ready and how much left and what ip and how we connect / shh public / private all vms . 
+    create another: start.sh which is interactive script for managing things and ssh .. what do you want to do? create infra and confs from .env, destroy everything, and etc all working 
+    also the start.sh script allow to change the dcv password okay ??
+
+10. os
+    ubuntu desktop 24.* witrh gnome not any other desktop environment
+
+11. setup
+    what values i need and how can i find or do i need to create ??
+    create a docs called: SETUP.md for setting up values .. 
+    also create a setup.sh for downloading and setting up things in local machine
+
+12. scalability
+    in each and every file, possible and recommended, add some comments how we can customize/ configure for scalability
+
+13. users
+    user is local host users, they connect using user*.conf file to vpn, then they will open the dcv client and enter the details from the file : connection-info-user*.txt to connect to the dcv server connected to the private instance
+    so if i stop the ec2 instance from console and start/restart from aws side does it saves states , configs , datas ?? like a normal PC ??
+    our acchitecture should be static private IPs because we have to give this to our clients.
+    currently its installing just ran the create.sh script.
+    one time IP and password is given. eventhough vpn server's IP changes, we can't change the private instances dcv server's IP changed.
+
+14. admin
+    the start file should give access to ssh any of the private instance too,.. for testing proposes .. for checlking latencies and etc . 
+
+15. workflow
+    create a dcv server completelely, then create ami if want more upgrade dcv server amount, or reduce etc commands also control that from start file
+    but tell in the script that if faster: it will create an ami and store on s3 same s3 and then import copies .. 
+    two options: typical around 20 - 40 minutes from start | ami = in 10 - 20 minutes but vm should not be used by anyone because same data copied ?
+    AMI with Ubuntu GNOME full desktop and DCV pre-installed using Packer, then launch instances via Terraform with dynamic SSH/user config to avoid copying sensitive data: remove sensitive data full format ... but with gnome and some good go
+
+16. problems
+    dcv server restarted and ssh cant, connection lost #fixed

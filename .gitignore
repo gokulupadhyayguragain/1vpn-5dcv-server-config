@@ -1,0 +1,9 @@
+.env
+.venv/
+.terraform/
+terraform/backend_override.tf
+*.tfstate
+*.tfstate.*
+*.retry
+/artifacts/
+ansible/inventories/hosts.ini

@@ -1,0 +1,31 @@
+[Unit]
+Description=DCV SELF-SERVICE HTTPS API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dcv-self-service
+Group=dcv-self-service
+ExecStart=/usr/bin/python3 /opt/dcv-self-service/dcv_self_service_api.py /etc/dcv-self-service/config.json
+Environment=HOME=/var/lib/dcv-self-service
+WorkingDirectory=/var/lib/dcv-self-service
+StateDirectory=dcv-self-service
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

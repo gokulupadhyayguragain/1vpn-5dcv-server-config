@@ -1,0 +1,58 @@
+---
+# COMMON SETTINGS BLOCK
+# CENTRALIZES GLOBAL SETTINGS SHARED BY ALL PLAYBOOKS.
+aws_region: "{{ lookup('env', 'AWS_REGION') | default('us-east-1', true) }}"
+project_name: "{{ lookup('env', 'PROJECT_NAME') | default('dcv-improvised', true) }}"
+vpc_cidr: "{{ lookup('env', 'VPC_CIDR') | default('10.20.0.0/16', true) }}"
+allowed_admin_cidr: "{{ lookup('env', 'ALLOWED_ADMIN_CIDR') | default('0.0.0.0/0', true) }}"
+vpn_client_cidr: "{{ lookup('env', 'VPN_CLIENT_CIDR') | default('10.8.0.0/24', true) }}"
+public_subnet_cidr: "{{ lookup('env', 'PUBLIC_SUBNET_CIDR') | default('10.20.1.0/24', true) }}"
+private_subnet_cidr: "{{ lookup('env', 'PRIVATE_SUBNET_CIDR') | default('10.20.2.0/24', true) }}"
+dcv_self_service_port: "{{ lookup('env', 'DCV_SELF_SERVICE_PORT') | default('8444', true) | int }}"
+dcv_vpn_active_seconds: "{{ lookup('env', 'DCV_VPN_ACTIVE_SECONDS') | default('180', true) | int }}"
+dcv_disconnect_grace_seconds: "{{ lookup('env', 'DCV_DISCONNECT_GRACE_SECONDS') | default('600', true) | int }}"
+dcv_idle_timeout_minutes: "{{ lookup('env', 'DCV_IDLE_TIMEOUT_MINUTES') | default('10', true) | int }}"
+dcv_idle_timeout_warning_seconds: "{{ lookup('env', 'DCV_IDLE_TIMEOUT_WARNING_SECONDS') | default('120', true) | int }}"
+dcv_stop_after_idle_disconnect_seconds: "{{ lookup('env', 'DCV_STOP_AFTER_IDLE_DISCONNECT_SECONDS') | default('60', true) | int }}"
+vpn_client_network: "{{ vpn_client_cidr.split('/')[0] }}"
+vpn_client_prefix: "{{ vpn_client_cidr.split('/')[1] | int }}"
+vpn_users_csv: "{{ lookup('env', 'VPN_USERS_CSV') | default('user1,user2', true) }}"
+vpn_users: "{{ vpn_users_csv.split(',') | map('trim') | reject('equalto', '') | list }}"
+s3_bucket_name: "{{ lookup('env', 'S3_BUCKET_NAME') }}"
+dcv_admin_username: "ubuntu"
+dcv_legacy_session_password: "{{ lookup('env', 'DCV_SESSION_PASSWORD') | default('', true) }}"
+dcv_default_user_sudo_raw: "{{ lookup('env', 'DCV_USER_SUDO') | default('true', true) }}"
+pivpn_profile_dir: "/home/ubuntu/configs"
+
+# DCV PACKAGE SOURCE BLOCK
+# DEFINES NICE DCV SERVER PACKAGE LOCATION PLUS HOST BOOTSTRAP SETTINGS FOR UBUNTU 24.04.
+dcv_package_url: "{{ lookup('env', 'NICE_DCV_DOWNLOAD_URL') | default('https://d1uj6qtbmh3dt5.cloudfront.net/2025.0/Servers/nice-dcv-2025.0-20103-ubuntu2404-x86_64.tgz', true) }}"
+dcv_swap_size_gb: "{{ lookup('env', 'DCV_SWAP_SIZE_GB') | default('4', true) | int }}"
+dcv_config_serial: "{{ lookup('env', 'DCV_CONFIG_SERIAL') | default('1', true) | int }}"
+dcv_desktop_packages:
+  - ubuntu-desktop
+  - gdm3
+  - gnome-terminal
+  - gnome-text-editor
+  - gnome-system-monitor
+  - mesa-utils
+dcv_bootstrap_state_dir: /var/lib/dcv-bootstrap
+dcv_bootstrap_script_path: /usr/local/sbin/dcv-desktop-bootstrap.sh
+dcv_bootstrap_log_path: /var/log/dcv-desktop-bootstrap.log
+dcv_bootstrap_done_marker: /var/lib/dcv-bootstrap/desktop.done
+dcv_bootstrap_failed_marker: /var/lib/dcv-bootstrap/desktop.failed
+dcv_netplan_path: /etc/netplan/60-dcv-improvised-networkd.yaml
+dcv_networkmanager_unmanaged_path: /etc/NetworkManager/conf.d/90-dcv-server-unmanaged-primary-nic.conf
+dcv_network_guard_script_path: /usr/local/sbin/dcv-network-guard.sh
+dcv_network_guard_service_name: dcv-network-guard.service
+dcv_bootstrap_timeout_seconds: "{{ lookup('env', 'DCV_BOOTSTRAP_TIMEOUT_SECONDS') | default('5400', true) | int }}"
+dcv_bootstrap_poll_interval_seconds: "{{ lookup('env', 'DCV_BOOTSTRAP_POLL_INTERVAL_SECONDS') | default('20', true) | int }}"
+dcv_package_archive: "/tmp/nice-dcv-server.tgz"
+dcv_extract_dir: "/tmp/nice-dcv-server"
+artifacts_local_dir: "{{ playbook_dir }}/../../artifacts"
+dcv_install_dev_toolchain: "{{ lookup('env', 'DCV_INSTALL_DEV_TOOLCHAIN') | default('true', true) | bool }}"
+dcv_flutter_install_dir: "{{ lookup('env', 'DCV_FLUTTER_INSTALL_DIR') | default('/opt/flutter', true) }}"
+dcv_spot_imds_poll_seconds: "{{ lookup('env', 'DCV_SPOT_IMDS_POLL_SECONDS') | default('5', true) | int }}"
+
+# SCALING NOTE BLOCK
+# KEEP VPN_USERS_CSV AND DCV_INSTANCE_COUNT MATCHED FOR 1:1 USER-TO-HOST ASSIGNMENT, TUNE DCV_CONFIG_SERIAL FOR LARGE FLEETS, AND SIZE DCV HOSTS FOR THE FULL UBUNTU GNOME DESKTOP INSTALL.

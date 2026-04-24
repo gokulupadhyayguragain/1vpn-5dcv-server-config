@@ -1,0 +1,416 @@
+{% raw %}
+#!/usr/bin/env python3
+import base64
+import crypt
+import hashlib
+import hmac
+import html
+import json
+import ssl
+import subprocess
+import sys
+from http import HTTPStatus
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "/etc/dcv-self-service/config.json"
+with open(CONFIG_PATH, encoding="utf-8") as config_file:
+    CONFIG = json.load(config_file)
+
+REALM = f"{CONFIG['project_name']} DCV SELF-SERVICE"
+JSON_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Type": "application/json; charset=utf-8",
+}
+HTML_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Type": "text/html; charset=utf-8",
+}
+
+
+# AUTHENTICATION BLOCK
+# ENFORCES BASIC AUTH WITH THE SAME DCV USERNAME AND PASSWORD SO USERS ONLY NEED THEIR VPN PROFILE PLUS THEIR NORMAL DCV CREDENTIALS.
+def parse_basic_auth(header_value):
+    if not header_value or not header_value.startswith("Basic "):
+        return "", ""
+
+    try:
+        decoded_value = base64.b64decode(header_value.split(" ", 1)[1]).decode("utf-8")
+    except Exception:
+        return "", ""
+
+    if ":" not in decoded_value:
+        return "", ""
+
+    username, password = decoded_value.split(":", 1)
+    return username, password
+
+
+def load_user_record(username):
+    return CONFIG["users"].get(username)
+
+
+def verify_password(username, password):
+    user_record = load_user_record(username)
+    if not user_record:
+        return False
+
+    password_hash = user_record["password_hash"]
+    return hmac.compare_digest(crypt.crypt(password, password_hash), password_hash)
+
+
+def build_csrf_token(username):
+    secret_material = f"{CONFIG['csrf_secret']}:{username}:{CONFIG['users'][username]['password_hash']}"
+    return hmac.new(
+        CONFIG["csrf_secret"].encode("utf-8"),
+        secret_material.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def parse_helper_output(output_text):
+    parsed_output = {}
+    for raw_line in output_text.splitlines():
+        if "=" in raw_line:
+            key, value = raw_line.split("=", 1)
+            parsed_output[key] = value
+    return parsed_output
+
+
+def run_helper(action, username):
+    completed_process = subprocess.run(
+        [CONFIG["helper_path"], "--admin", action, username],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed_process.returncode != 0:
+        error_text = completed_process.stderr.strip() or completed_process.stdout.strip() or "UNKNOWN HELPER ERROR"
+        raise RuntimeError(error_text)
+
+    helper_result = parse_helper_output(completed_process.stdout)
+    helper_result["ACTION"] = action
+    return helper_result
+
+
+class DcvSelfServiceHandler(BaseHTTPRequestHandler):
+    def log_message(self, format_string, *args):
+        return
+
+    def request_authentication(self):
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", f'Basic realm="{REALM}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def authenticate(self):
+        username, password = parse_basic_auth(self.headers.get("Authorization", ""))
+        if not username or not verify_password(username, password):
+            self.request_authentication()
+            return None
+        return username
+
+    def send_json_response(self, status_code, payload):
+        payload_bytes = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        self.send_response(status_code)
+        for header_name, header_value in JSON_HEADERS.items():
+            self.send_header(header_name, header_value)
+        self.send_header("Content-Length", str(len(payload_bytes)))
+        self.end_headers()
+        self.wfile.write(payload_bytes)
+
+    def send_html_response(self, status_code, html_body, csrf_token=""):
+        body_bytes = html_body.encode("utf-8")
+        self.send_response(status_code)
+        for header_name, header_value in HTML_HEADERS.items():
+            self.send_header(header_name, header_value)
+        if csrf_token:
+            self.send_header(
+                "Set-Cookie",
+                f"dcv_self_service_csrf={csrf_token}; HttpOnly; SameSite=Strict; Secure; Path=/",
+            )
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    def send_error_page(self, username, error_text, status_code=HTTPStatus.BAD_GATEWAY):
+        page_html = self.render_dashboard(username, {}, {"MESSAGE": error_text})
+        self.send_html_response(status_code, page_html, build_csrf_token(username))
+
+    def read_form_body(self):
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        raw_body = self.rfile.read(content_length).decode("utf-8")
+        return parse_qs(raw_body)
+
+    def valid_html_csrf(self, username, form_data):
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        cookie_token = cookie.get("dcv_self_service_csrf")
+        form_token = form_data.get("csrf_token", [""])[0]
+        expected_token = build_csrf_token(username)
+        return (
+            cookie_token is not None
+            and hmac.compare_digest(cookie_token.value, expected_token)
+            and hmac.compare_digest(form_token, expected_token)
+        )
+
+    # RESPONSE RENDER BLOCK
+    # PROVIDES BOTH A SIMPLE BROWSER PAGE AND CURL-FRIENDLY JSON ENDPOINTS SO USERS CAN SELF-SERVICE POWER ACTIONS AFTER CONNECTING TO THE VPN.
+    def render_dashboard(self, username, status_result, message_result):
+        safe_username = html.escape(username)
+        state_value = html.escape(status_result.get("STATE", "UNKNOWN"))
+        instance_id = html.escape(status_result.get("INSTANCE_ID", "UNKNOWN"))
+        private_ip = html.escape(status_result.get("DCV_PRIVATE_IP", "UNKNOWN"))
+        web_url = html.escape(status_result.get("DCV_WEB_URL", "UNKNOWN"))
+        ready_state = html.escape(message_result.get("READY", ""))
+        message_text = html.escape(message_result.get("MESSAGE", ""))
+        csrf_token = build_csrf_token(username)
+
+        message_block = ""
+        if ready_state or message_text:
+            message_block = f"""
+            <section class="message">
+              <p><strong>READY:</strong> {ready_state or "N/A"}</p>
+              <p><strong>MESSAGE:</strong> {message_text or "NONE"}</p>
+            </section>
+            """
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DCV SELF-SERVICE</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f5f6f1;
+      --card: #ffffff;
+      --ink: #163229;
+      --muted: #4e665f;
+      --accent: #165d4b;
+      --accent-2: #d8efe8;
+      --danger: #8d2f2f;
+      --border: #d7e1dc;
+    }}
+    body {{
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #ffffff 0%, var(--bg) 65%);
+      color: var(--ink);
+    }}
+    main {{
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }}
+    .hero {{
+      margin-bottom: 24px;
+    }}
+    .hero h1 {{
+      margin: 0 0 8px;
+      font-size: 2rem;
+      letter-spacing: 0.04em;
+    }}
+    .hero p {{
+      margin: 0;
+      color: var(--muted);
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
+    }}
+    .card {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 14px 34px rgba(17, 46, 38, 0.07);
+    }}
+    .card h2 {{
+      margin: 0 0 10px;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }}
+    .card p {{
+      margin: 0;
+      word-break: break-word;
+      font-size: 1rem;
+    }}
+    .actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 18px;
+    }}
+    .actions form {{
+      margin: 0;
+    }}
+    button {{
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 18px;
+      font-weight: 700;
+      cursor: pointer;
+      background: var(--accent);
+      color: #ffffff;
+    }}
+    button.secondary {{
+      background: var(--accent-2);
+      color: var(--ink);
+    }}
+    button.danger {{
+      background: var(--danger);
+    }}
+    .message {{
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      margin-bottom: 18px;
+    }}
+    .message p {{
+      margin: 6px 0;
+    }}
+    .notes {{
+      background: #eef7f3;
+      border-radius: 16px;
+      padding: 18px;
+      color: var(--muted);
+    }}
+    a {{
+      color: var(--accent);
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <h1>DCV SELF-SERVICE</h1>
+      <p>VPN-ONLY CONTROL PANEL FOR <strong>{safe_username}</strong>.</p>
+    </section>
+    {message_block}
+    <section class="actions">
+      <form method="post" action="/start">
+        <input type="hidden" name="csrf_token" value="{csrf_token}">
+        <button type="submit">START MY DCV HOST</button>
+      </form>
+      <form method="post" action="/stop">
+        <input type="hidden" name="csrf_token" value="{csrf_token}">
+        <button class="danger" type="submit">STOP MY DCV HOST</button>
+      </form>
+      <form method="get" action="/">
+        <button class="secondary" type="submit">REFRESH STATUS</button>
+      </form>
+    </section>
+    <section class="grid">
+      <article class="card">
+        <h2>User</h2>
+        <p>{safe_username}</p>
+      </article>
+      <article class="card">
+        <h2>State</h2>
+        <p>{state_value}</p>
+      </article>
+      <article class="card">
+        <h2>Instance ID</h2>
+        <p>{instance_id}</p>
+      </article>
+      <article class="card">
+        <h2>Private IP</h2>
+        <p>{private_ip}</p>
+      </article>
+      <article class="card">
+        <h2>DCV URL</h2>
+        <p><a href="{web_url}">{web_url}</a></p>
+      </article>
+      <article class="card">
+        <h2>JSON Status API</h2>
+        <p><a href="/status">/status</a></p>
+      </article>
+    </section>
+    <section class="notes">
+      <p>CONNECT TO THE VPN FIRST, THEN SIGN IN HERE WITH THE SAME DCV USERNAME AND PASSWORD YOU USE FOR THE DESKTOP LOGIN.</p>
+      <p>CLI USERS CAN RUN <code>curl -ksS -u {safe_username}:'&lt;YOUR_DCV_PASSWORD&gt;' https://{html.escape(CONFIG['bind_host'])}:{CONFIG['port']}/status</code>.</p>
+    </section>
+  </main>
+</body>
+</html>"""
+
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/healthz":
+            self.send_json_response(HTTPStatus.OK, {"status": "ok"})
+            return
+
+        username = self.authenticate()
+        if username is None:
+            return
+
+        try:
+            status_result = run_helper("status", username)
+        except RuntimeError as error:
+            if parsed_path.path == "/status":
+                self.send_json_response(HTTPStatus.BAD_GATEWAY, {"error": str(error), "user": username})
+                return
+            self.send_error_page(username, str(error))
+            return
+
+        if parsed_path.path == "/status":
+            self.send_json_response(HTTPStatus.OK, {"user": username, "result": status_result})
+            return
+
+        page_html = self.render_dashboard(username, status_result, {})
+        self.send_html_response(HTTPStatus.OK, page_html, build_csrf_token(username))
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        username = self.authenticate()
+        if username is None:
+            return
+
+        if parsed_path.path in {"/start", "/stop"}:
+            form_data = self.read_form_body()
+            if not self.valid_html_csrf(username, form_data):
+                self.send_error_page(username, "INVALID OR MISSING CSRF TOKEN.", HTTPStatus.FORBIDDEN)
+                return
+            action = parsed_path.path.lstrip("/")
+            try:
+                action_result = run_helper(action, username)
+                status_result = run_helper("status", username)
+            except RuntimeError as error:
+                self.send_error_page(username, str(error))
+                return
+            page_html = self.render_dashboard(username, status_result, action_result)
+            self.send_html_response(HTTPStatus.OK, page_html, build_csrf_token(username))
+            return
+
+        if parsed_path.path in {"/api/start", "/api/stop"}:
+            action = parsed_path.path.rsplit("/", 1)[-1]
+            try:
+                action_result = run_helper(action, username)
+            except RuntimeError as error:
+                self.send_json_response(HTTPStatus.BAD_GATEWAY, {"error": str(error), "user": username})
+                return
+            self.send_json_response(HTTPStatus.OK, {"user": username, "result": action_result})
+            return
+
+        self.send_json_response(HTTPStatus.NOT_FOUND, {"error": "NOT FOUND"})
+
+
+def main():
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(CONFIG["tls_cert_path"], CONFIG["tls_key_path"])
+
+    http_server = ThreadingHTTPServer((CONFIG["bind_host"], int(CONFIG["port"])), DcvSelfServiceHandler)
+    http_server.socket = ssl_context.wrap_socket(http_server.socket, server_side=True)
+    http_server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+{% endraw %}

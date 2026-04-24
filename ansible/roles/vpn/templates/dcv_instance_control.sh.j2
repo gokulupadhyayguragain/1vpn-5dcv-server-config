@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# CONFIGURATION BLOCK
+# EMBEDS THE PROJECT AND REGION CONTEXT SO THE HELPER CAN CONTROL ONLY THE DCV INSTANCES CREATED BY THIS STACK.
+PROJECT_NAME="{{ project_name }}"
+AWS_REGION="{{ aws_region }}"
+DCV_PORT="8443"
+
+print_usage() {
+  echo "USAGE:"
+  echo "  ADMIN: dcv-instance-control --admin <status|start|stop> <vpn-user>"
+}
+
+normalize_action() {
+  local raw_action="${1:-status}"
+
+  case "${raw_action,,}" in
+    status|state)
+      printf 'status\n'
+      ;;
+    start|on|poweron|wake)
+      printf 'start\n'
+      ;;
+    stop|off|poweroff|shutdown)
+      printf 'stop\n'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+load_target_instance() {
+  local describe_output=""
+  local matching_count=""
+
+  describe_output="$(
+    aws ec2 describe-instances \
+      --region "$AWS_REGION" \
+      --filters \
+        "Name=tag:Project,Values=$PROJECT_NAME" \
+        "Name=tag:Role,Values=dcv" \
+        "Name=tag:VpnUser,Values=$TARGET_USER" \
+        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+      --query 'Reservations[].Instances[].[InstanceId,PrivateIpAddress,State.Name]' \
+      --output text
+  )"
+
+  matching_count="$(printf '%s\n' "$describe_output" | sed '/^[[:space:]]*$/d' | wc -l | xargs)"
+  if [[ "$matching_count" != "1" ]]; then
+    echo "ERROR: Expected exactly one DCV instance for VPN user ${TARGET_USER}, but found ${matching_count}."
+    exit 1
+  fi
+
+  read -r TARGET_INSTANCE_ID TARGET_PRIVATE_IP TARGET_STATE <<<"$(printf '%s\n' "$describe_output" | sed '/^[[:space:]]*$/d')"
+  if [[ -z "${TARGET_INSTANCE_ID:-}" || -z "${TARGET_PRIVATE_IP:-}" || -z "${TARGET_STATE:-}" ]]; then
+    echo "ERROR: Could not resolve the DCV instance details for VPN user ${TARGET_USER}."
+    exit 1
+  fi
+}
+
+wait_for_instance_state() {
+  local desired_state="$1"
+  local max_attempts="$2"
+  local attempt_number=0
+
+  while (( attempt_number < max_attempts )); do
+    load_target_instance
+    if [[ "$TARGET_STATE" == "$desired_state" ]]; then
+      return 0
+    fi
+
+    sleep 5
+    attempt_number="$((attempt_number + 1))"
+  done
+
+  return 1
+}
+
+wait_for_instance_status_ok() {
+  local max_attempts="$1"
+  local attempt_number=0
+  local status_line=""
+  local system_status=""
+  local instance_status=""
+
+  while (( attempt_number < max_attempts )); do
+    status_line="$(
+      aws ec2 describe-instance-status \
+        --region "$AWS_REGION" \
+        --instance-ids "$TARGET_INSTANCE_ID" \
+        --include-all-instances \
+        --query 'InstanceStatuses[0].[SystemStatus.Status,InstanceStatus.Status]' \
+        --output text 2>/dev/null || true
+    )"
+
+    read -r system_status instance_status <<<"$status_line"
+    if [[ "$system_status" == "ok" && "$instance_status" == "ok" ]]; then
+      return 0
+    fi
+
+    sleep 10
+    attempt_number="$((attempt_number + 1))"
+  done
+
+  return 1
+}
+
+print_status() {
+  echo "USER=${TARGET_USER}"
+  echo "INSTANCE_ID=${TARGET_INSTANCE_ID}"
+  echo "STATE=${TARGET_STATE}"
+  echo "DCV_PRIVATE_IP=${TARGET_PRIVATE_IP}"
+  echo "DCV_WEB_URL=https://${TARGET_PRIVATE_IP}:${DCV_PORT}"
+}
+
+MODE="${1:-}"
+TARGET_USER=""
+RAW_ACTION=""
+ACTION=""
+
+case "$MODE" in
+  --admin)
+    RAW_ACTION="${2:-status}"
+    TARGET_USER="${3:-}"
+    if [[ -z "$TARGET_USER" ]]; then
+      print_usage
+      exit 1
+    fi
+    ;;
+  *)
+    print_usage
+    exit 1
+    ;;
+esac
+
+if ! ACTION="$(normalize_action "$RAW_ACTION")"; then
+  echo "ERROR: Unsupported action '${RAW_ACTION}'. Allowed values are status, start, and stop."
+  exit 1
+fi
+
+load_target_instance
+
+case "$ACTION" in
+  status)
+    logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=status STATE=${TARGET_STATE} INSTANCE_ID=${TARGET_INSTANCE_ID}"
+    print_status
+    ;;
+  start)
+    if [[ "$TARGET_STATE" == "running" || "$TARGET_STATE" == "pending" ]]; then
+      logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=start STATE=already-running-or-pending INSTANCE_ID=${TARGET_INSTANCE_ID}"
+      print_status
+      echo "READY=INSTANCE_ALREADY_RUNNING_OR_STARTING"
+      exit 0
+    fi
+
+    if [[ "$TARGET_STATE" == "stopping" ]]; then
+      logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=start STATE=currently-stopping INSTANCE_ID=${TARGET_INSTANCE_ID}"
+      print_status
+      echo "READY=INSTANCE_CURRENTLY_STOPPING_TRY_AGAIN_SOON"
+      exit 0
+    fi
+
+    aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$TARGET_INSTANCE_ID" >/dev/null
+    if ! wait_for_instance_state "running" 48; then
+      echo "ERROR: Instance ${TARGET_INSTANCE_ID} did not reach the running state within the expected time."
+      exit 1
+    fi
+
+    if wait_for_instance_status_ok 36; then
+      logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=start STATE=running INSTANCE_ID=${TARGET_INSTANCE_ID}"
+      print_status
+      echo "READY=INSTANCE_STATUS_OK"
+    else
+      logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=start STATE=running-pending-checks INSTANCE_ID=${TARGET_INSTANCE_ID}"
+      print_status
+      echo "READY=INSTANCE_RUNNING_BUT_STATUS_CHECKS_STILL_PENDING"
+    fi
+    ;;
+  stop)
+    if [[ "$TARGET_STATE" == "stopped" || "$TARGET_STATE" == "stopping" ]]; then
+      logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=stop STATE=already-stopped-or-stopping INSTANCE_ID=${TARGET_INSTANCE_ID}"
+      print_status
+      echo "READY=INSTANCE_ALREADY_STOPPED_OR_STOPPING"
+      exit 0
+    fi
+
+    aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$TARGET_INSTANCE_ID" >/dev/null
+    if ! wait_for_instance_state "stopped" 48; then
+      echo "ERROR: Instance ${TARGET_INSTANCE_ID} did not reach the stopped state within the expected time."
+      exit 1
+    fi
+
+    logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=stop STATE=stopped INSTANCE_ID=${TARGET_INSTANCE_ID}"
+    print_status
+    echo "READY=INSTANCE_STOPPED"
+    ;;
+esac

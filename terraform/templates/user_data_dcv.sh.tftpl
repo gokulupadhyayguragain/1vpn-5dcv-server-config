@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# EARLY NETWORK GUARD BLOCK
+# INSTALLS A BOOT-TIME NETWORK AND SSH RECOVERY GUARD BEFORE ANSIBLE RUNS SO FULL DESKTOP PACKAGES CANNOT LEAVE THE PRIVATE EC2 NIC UNMANAGED AFTER REBOOTS.
+cat >/usr/local/sbin/dcv-network-guard.sh <<'DCV_NETWORK_GUARD_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PRIMARY_NIC="$(ip -o route show to default 2>/dev/null | awk '{print $5; exit}')"
+if [[ -z "$${PRIMARY_NIC}" ]]; then
+  PRIMARY_NIC="$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')"
+fi
+
+if [[ -z "$${PRIMARY_NIC}" ]]; then
+  exit 0
+fi
+
+# NETWORK PERSISTENCE BLOCK
+# WRITES A NETPLAN OVERRIDE THAT KEEPS THE PRIVATE NIC ON SYSTEMD-NETWORKD EVEN AFTER UBUNTU DESKTOP INSTALLS NETWORKMANAGER COMPONENTS.
+mkdir -p /etc/netplan /etc/NetworkManager/conf.d
+cat >/etc/netplan/60-dcv-improvised-networkd.yaml <<NETPLAN_EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $${PRIMARY_NIC}:
+      dhcp4: true
+      dhcp6: false
+      optional: true
+NETPLAN_EOF
+
+cat >/etc/NetworkManager/conf.d/90-dcv-server-unmanaged-primary-nic.conf <<NETWORKMANAGER_EOF
+[keyfile]
+unmanaged-devices=interface-name:$${PRIMARY_NIC}
+NETWORKMANAGER_EOF
+
+systemctl unmask systemd-networkd.service 2>/dev/null || true
+systemctl enable systemd-networkd.service 2>/dev/null || true
+systemctl restart systemd-networkd.service 2>/dev/null || true
+systemctl unmask systemd-resolved.service 2>/dev/null || true
+systemctl enable systemd-resolved.service 2>/dev/null || true
+systemctl restart systemd-resolved.service 2>/dev/null || true
+systemctl stop systemd-networkd-wait-online.service 2>/dev/null || true
+systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+systemctl mask systemd-networkd-wait-online.service 2>/dev/null || true
+systemctl stop NetworkManager.service 2>/dev/null || true
+systemctl disable NetworkManager.service 2>/dev/null || true
+systemctl mask NetworkManager.service 2>/dev/null || true
+systemctl stop NetworkManager-wait-online.service 2>/dev/null || true
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+systemctl mask NetworkManager-wait-online.service 2>/dev/null || true
+systemctl stop ModemManager.service 2>/dev/null || true
+systemctl disable ModemManager.service 2>/dev/null || true
+systemctl mask ModemManager.service 2>/dev/null || true
+
+# SSH RECOVERY BLOCK
+# KEEPS OPENSSH ON A PERSISTENT SERVICE SO THE BASTION CAN REACH THE DCV HOST AS SOON AS THE PRIVATE NIC IS BACK.
+systemctl stop ssh.socket 2>/dev/null || true
+systemctl disable ssh.socket 2>/dev/null || true
+systemctl mask ssh.socket 2>/dev/null || true
+systemctl unmask ssh.service 2>/dev/null || true
+systemctl enable ssh.service 2>/dev/null || true
+systemctl restart ssh.service 2>/dev/null || true
+
+netplan generate 2>/dev/null || true
+netplan apply 2>/dev/null || true
+DCV_NETWORK_GUARD_EOF
+
+chmod 0755 /usr/local/sbin/dcv-network-guard.sh
+
+cat >/etc/systemd/system/dcv-network-guard.service <<'DCV_NETWORK_SERVICE_EOF'
+[Unit]
+Description=DCV EARLY NETWORK RECOVERY GUARD
+Wants=cloud-final.service
+After=cloud-final.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dcv-network-guard.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+DCV_NETWORK_SERVICE_EOF
+
+systemctl daemon-reload
+systemctl enable dcv-network-guard.service
+/usr/local/sbin/dcv-network-guard.sh || true

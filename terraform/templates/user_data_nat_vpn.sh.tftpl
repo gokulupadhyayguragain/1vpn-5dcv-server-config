@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# NAT FORWARDING BLOCK
+# ENABLES L3 FORWARDING SO PRIVATE SUBNET CAN REACH INTERNET VIA THIS HOST.
+export DEBIAN_FRONTEND=noninteractive
+PRIMARY_NIC="$(ip -o route show to default 2>/dev/null | awk '{print $5; exit}')"
+if [[ -z "$${PRIMARY_NIC}" ]]; then
+  PRIMARY_NIC="$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')"
+fi
+sysctl -w net.ipv4.ip_forward=1
+sed -i 's/^#\?net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+
+# NAT RULES BLOCK
+# MASQUERADES PRIVATE SUBNET TRAFFIC OUTBOUND OVER PRIMARY NETWORK INTERFACE.
+apt-get update -y
+echo 'iptables-persistent iptables-persistent/autosave_v4 boolean true' | debconf-set-selections
+echo 'iptables-persistent iptables-persistent/autosave_v6 boolean true' | debconf-set-selections
+apt-get install -y iptables-persistent
+iptables -t nat -A POSTROUTING -s ${private_subnet_cidr} -o "$${PRIMARY_NIC}" -j MASQUERADE
+netfilter-persistent save

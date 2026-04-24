@@ -1,0 +1,10 @@
+---
+# DCV PLAY BLOCK
+# CONFIGURES PRIVATE DCV HOSTS WITH NICE DCV AND HARDENING.
+- name: Configure DCV servers
+  hosts: dcv
+  become: true
+  serial: "{{ lookup('env', 'DCV_CONFIG_SERIAL') | default('1', true) | int }}"
+  roles:
+    - role: common
+    - role: dcv

@@ -1,0 +1,94 @@
+---
+# FIRST-BOOT READINESS BLOCK
+# WAITS FOR CLOUD-INIT AND PACKAGE MANAGERS TO FINISH SO ANSIBLE DOES NOT COLLIDE WITH UBUNTU'S INITIAL BOOTSTRAP WORK.
+- name: Wait for cloud-init to finish on Ubuntu hosts
+  ansible.builtin.command: cloud-init status --wait
+  register: cloud_init_wait
+  failed_when: false
+  changed_when: false
+
+- name: Verify cloud-init reached boot-finished state
+  ansible.builtin.stat:
+    path: /var/lib/cloud/instance/boot-finished
+  register: cloud_init_boot_finished
+
+- name: Fail when cloud-init never reached boot-finished state
+  ansible.builtin.assert:
+    that:
+      - cloud_init_boot_finished.stat.exists
+    fail_msg: "CLOUD-INIT DID NOT REACH /var/lib/cloud/instance/boot-finished ON THIS HOST."
+
+- name: Show cloud-init status when it completed with warnings or errors
+  ansible.builtin.debug:
+    msg: "CLOUD-INIT REPORTED '{{ (cloud_init_wait.stdout | default('UNKNOWN')) | trim }}' BUT BOOT-FINISHED EXISTS, SO CONFIGURATION WILL CONTINUE."
+  when: cloud_init_wait.rc != 0
+
+- name: Wait for apt and dpkg locks to clear
+  ansible.builtin.shell: |
+    set -euo pipefail
+    timeout_seconds=900
+    start_time="$(date +%s)"
+
+    while pgrep -x apt >/dev/null 2>&1 \
+      || pgrep -x apt-get >/dev/null 2>&1 \
+      || pgrep -x dpkg >/dev/null 2>&1 \
+      || pgrep -x unattended-upgrade >/dev/null 2>&1; do
+      if (( "$(date +%s)" - start_time >= timeout_seconds )); then
+        echo "APT OR DPKG WORK DID NOT FINISH WITHIN ${timeout_seconds} SECONDS."
+        exit 1
+      fi
+      sleep 10
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+# PACKAGE BASELINE BLOCK
+# INSTALLS CORE UTILITIES USED FOR SECURITY AND OPERATIONS.
+- name: Create shared Ansible remote tmp directory
+  ansible.builtin.file:
+    path: /var/tmp/.ansible/tmp
+    state: directory
+    mode: "1777"
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install baseline packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - git
+      - unzip
+      - jq
+      - ufw
+      - unattended-upgrades
+      - lynis
+    state: present
+
+# OS HARDENING BLOCK
+# ENABLES AUTOMATIC SECURITY UPDATES AND BASIC FIREWALL POLICY.
+- name: Enable unattended upgrades service
+  ansible.builtin.systemd:
+    name: unattended-upgrades
+    enabled: true
+    state: started
+
+- name: Set UFW default deny incoming
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+- name: Set UFW default allow outgoing
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+# FIREWALL ENABLEMENT BLOCK
+# DEFERS UFW ENABLEMENT UNTIL HOST-SPECIFIC ALLOW RULES EXIST SO NEW HOSTS DO NOT LOCK OUT SSH MID-PROVISION.
+- name: Defer UFW enablement to host-specific roles
+  ansible.builtin.debug:
+    msg: "COMMON ROLE DEFERS UFW ENABLEMENT UNTIL VPN OR DCV-SPECIFIC ALLOW RULES ARE APPLIED."
+  changed_when: false

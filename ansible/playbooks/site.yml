@@ -1,0 +1,6 @@
+---
+# ORCHESTRATION BLOCK
+# RUNS VPN CONFIG FIRST, EXPORTS VPN ARTIFACTS EARLY, AND THEN CONTINUES TO DCV SO USER .CONF FILES EXIST EVEN IF DCV IS STILL BUILDING.
+- import_playbook: vpn.yml
+- import_playbook: artifacts.yml
+- import_playbook: dcv.yml

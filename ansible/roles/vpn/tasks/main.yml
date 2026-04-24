@@ -1,0 +1,417 @@
+---
+# NETWORK IDENTITY BLOCK
+# DERIVES THE REAL PRIMARY EC2 NIC NAME SO NAT AND UFW RULES WORK EVEN WHEN THE INTERFACE IS NOT CALLED ens5.
+- name: Derive the primary public NIC name for the VPN host
+  ansible.builtin.set_fact:
+    vpn_primary_interface: "{{ ansible_default_ipv4.interface | default((ansible_interfaces | reject('equalto', 'lo') | list | first) | default('eth0')) }}"
+
+# VPN FIREWALL BLOCK
+# ALLOWS SSH AND WIREGUARD PORTS REQUIRED FOR VPN CONNECTIVITY.
+- name: Allow SSH access on VPN host
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+
+- name: Allow WireGuard UDP port
+  community.general.ufw:
+    rule: allow
+    port: "51820"
+    proto: udp
+
+- name: Allow VPN-only DCV self-service HTTPS access on the VPN host
+  community.general.ufw:
+    rule: allow
+    port: "{{ dcv_self_service_port }}"
+    proto: tcp
+    src: "{{ vpn_client_cidr }}"
+
+- name: Allow private subnet forwarded traffic through VPN host
+  community.general.ufw:
+    rule: allow
+    route: true
+    src: "{{ private_subnet_cidr }}"
+    interface_in: "{{ vpn_primary_interface }}"
+    interface_out: "{{ vpn_primary_interface }}"
+
+- name: Allow VPN client forwarded traffic through VPN host
+  community.general.ufw:
+    rule: allow
+    route: true
+    src: "{{ vpn_client_cidr }}"
+    interface_in: wg0
+    interface_out: "{{ vpn_primary_interface }}"
+
+- name: Enable UFW on VPN host after allow rules are in place
+  community.general.ufw:
+    state: enabled
+
+# PIVPN INSTALL INPUT BLOCK
+# RENDERS A DETERMINISTIC UNATTENDED CONFIG SO PIVPN INSTALLS WITHOUT PROMPTS.
+- name: Render PiVPN unattended options
+  ansible.builtin.copy:
+    dest: /root/pivpn-options.conf
+    mode: "0600"
+    content: |
+      install_user=ubuntu
+      install_home=/home/ubuntu
+      VPN=wireguard
+      pivpnPROTO=udp
+      pivpnHOST={{ ansible_host }}
+      pivpnPORT=51820
+      pivpnDNS1=1.1.1.1
+      pivpnDNS2=1.0.0.1
+      pivpnNET={{ vpn_client_network }}
+      subnetClass={{ vpn_client_prefix }}
+      pivpnenableipv6=0
+      pivpnforceipv6route=0
+      UNATTUPG=1
+      ALLOWED_IPS="0.0.0.0/0, ::0/0"
+
+- name: Download PiVPN installer
+  ansible.builtin.get_url:
+    url: https://install.pivpn.io
+    dest: /root/pivpn-install.sh
+    mode: "0755"
+
+# PIVPN SOURCE PREP BLOCK
+# ENSURES THE PIVPN INSTALLER HAS A REAL SOURCE CHECKOUT BEFORE IT RUNS SO THE INSTALL DOES NOT DIE ON A FAILED SELF-CLONE.
+- name: Ensure PiVPN source parent directory exists
+  ansible.builtin.file:
+    path: /usr/local/src
+    state: directory
+    mode: "0755"
+
+- name: Check whether the PiVPN source checkout is already valid
+  ansible.builtin.stat:
+    path: /usr/local/src/pivpn/.git
+  register: pivpn_source_checkout
+
+- name: Remove broken PiVPN source directory when the checkout is incomplete
+  ansible.builtin.file:
+    path: /usr/local/src/pivpn
+    state: absent
+  when: not pivpn_source_checkout.stat.exists
+
+- name: Clone or update the PiVPN source checkout
+  ansible.builtin.git:
+    repo: https://github.com/pivpn/pivpn.git
+    dest: /usr/local/src/pivpn
+    version: master
+    force: true
+    update: true
+
+# PIVPN INSTALL BLOCK
+# INSTALLS PIVPN IN UNATTENDED MODE ON UBUNTU 24.04 USING THE RENDERED OPTIONS FILE.
+- name: Install PiVPN unattended
+  ansible.builtin.command: /bin/bash /root/pivpn-install.sh --unattended /root/pivpn-options.conf
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+  args:
+    creates: /etc/wireguard/wg0.conf
+
+- name: Ensure PiVPN profile directory exists
+  ansible.builtin.file:
+    path: "{{ pivpn_profile_dir }}"
+    state: directory
+    owner: ubuntu
+    group: ubuntu
+    mode: "0750"
+
+- name: Ensure WireGuard service is enabled
+  ansible.builtin.systemd:
+    name: wg-quick@wg0
+    enabled: true
+    state: started
+
+- name: Preseed iptables-persistent IPv4 autosave
+  ansible.builtin.debconf:
+    name: iptables-persistent
+    question: iptables-persistent/autosave_v4
+    value: "true"
+    vtype: boolean
+
+- name: Preseed iptables-persistent IPv6 autosave
+  ansible.builtin.debconf:
+    name: iptables-persistent
+    question: iptables-persistent/autosave_v6
+    value: "true"
+    vtype: boolean
+
+- name: Install iptables persistence package
+  ansible.builtin.apt:
+    name: iptables-persistent
+    state: present
+
+# NAT PERSISTENCE BLOCK
+# INSTALLS THE PERSISTENCE PACKAGE FIRST, THEN WRITES EXPLICIT RULES SO VPN CLIENTS KEEP THEIR 10.8.0.0/24 SOURCE IP INSIDE THE VPC BUT STILL GET INTERNET MASQUERADING.
+- name: Check private subnet NAT masquerade rule
+  ansible.builtin.command: "iptables -t nat -C POSTROUTING -s {{ private_subnet_cidr }} -o {{ vpn_primary_interface }} -j MASQUERADE"
+  register: private_nat_rule_check
+  changed_when: false
+  failed_when: private_nat_rule_check.rc not in [0, 1]
+
+- name: Add private subnet NAT masquerade rule
+  ansible.builtin.command: "iptables -t nat -A POSTROUTING -s {{ private_subnet_cidr }} -o {{ vpn_primary_interface }} -j MASQUERADE"
+  when: private_nat_rule_check.rc == 1
+
+- name: Check VPN client VPC NAT bypass rule
+  ansible.builtin.command: "iptables -t nat -C POSTROUTING -s {{ vpn_client_cidr }} -d {{ vpc_cidr }} -o {{ vpn_primary_interface }} -j RETURN"
+  register: vpn_client_vpc_bypass_rule_check
+  changed_when: false
+  failed_when: vpn_client_vpc_bypass_rule_check.rc not in [0, 1]
+
+- name: Add VPN client VPC NAT bypass rule
+  ansible.builtin.command: "iptables -t nat -I POSTROUTING 1 -s {{ vpn_client_cidr }} -d {{ vpc_cidr }} -o {{ vpn_primary_interface }} -j RETURN"
+  when: vpn_client_vpc_bypass_rule_check.rc == 1
+
+- name: Check VPN client NAT masquerade rule
+  ansible.builtin.command: "iptables -t nat -C POSTROUTING -s {{ vpn_client_cidr }} -o {{ vpn_primary_interface }} -j MASQUERADE"
+  register: vpn_client_nat_rule_check
+  changed_when: false
+  failed_when: vpn_client_nat_rule_check.rc not in [0, 1]
+
+- name: Add VPN client NAT masquerade rule
+  ansible.builtin.command: "iptables -t nat -A POSTROUTING -s {{ vpn_client_cidr }} -o {{ vpn_primary_interface }} -j MASQUERADE"
+  when: vpn_client_nat_rule_check.rc == 1
+
+- name: Save iptables rules
+  ansible.builtin.command: netfilter-persistent save
+  changed_when: false
+
+# FAIL2BAN HARDENING BLOCK
+# INSTALLS FAIL2BAN ONLY AFTER VPN ACCESS RULES EXIST AND TRUSTS THE ADMIN CIDR PLUS PRIVATE NETWORKS SO PROVISIONING AND VPN TRAFFIC DO NOT BAN THEMSELVES.
+- name: Ensure fail2ban drop-in directory exists on VPN host
+  ansible.builtin.file:
+    path: /etc/fail2ban/jail.d
+    state: directory
+    mode: "0755"
+
+- name: Render VPN fail2ban SSH jail override
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/dcv-improvised-sshd.local
+    mode: "0644"
+    content: |
+      [DEFAULT]
+      ignoreip = 127.0.0.1/8 ::1 {{ allowed_admin_cidr }} {{ public_subnet_cidr }} {{ private_subnet_cidr }} {{ vpn_client_cidr }}
+      bantime = 10m
+      findtime = 10m
+      maxretry = 10
+
+      [sshd]
+      enabled = true
+
+- name: Install fail2ban on VPN host without auto-starting default jails
+  ansible.builtin.apt:
+    name: fail2ban
+    state: present
+    policy_rc_d: 101
+
+- name: Enable and start fail2ban on VPN host after jail overrides are present
+  ansible.builtin.systemd:
+    name: fail2ban
+    enabled: true
+    state: started
+
+# SELF-SERVICE POWER CONTROL PACKAGE BLOCK
+# INSTALLS THE PACKAGES, SERVICE ACCOUNT, TLS MATERIAL, AND INTERNAL HTTPS APP USED FOR KEYLESS VPN-ONLY DCV POWER CONTROL.
+- name: Install packages required for keyless DCV self-service power control on the VPN host
+  ansible.builtin.apt:
+    name:
+      - openssl
+      - python3-pip
+      - python3-venv
+    state: present
+
+- name: Install AWS CLI into an isolated virtualenv on the VPN host
+  ansible.builtin.pip:
+    name: awscli
+    virtualenv: /opt/awscli-venv
+    virtualenv_command: python3 -m venv
+
+- name: Expose AWS CLI on the VPN host PATH
+  ansible.builtin.file:
+    src: /opt/awscli-venv/bin/aws
+    dest: /usr/local/bin/aws
+    state: link
+    force: true
+
+- name: Create the dedicated DCV self-service service account on the VPN host
+  ansible.builtin.user:
+    name: dcv-self-service
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+
+- name: Remove the legacy SSH-based DCV self-service account from the VPN host
+  ansible.builtin.user:
+    name: dcv-control
+    state: absent
+    remove: true
+
+- name: Ensure the DCV self-service state directory exists on the VPN host
+  ansible.builtin.file:
+    path: /etc/dcv-self-service
+    state: directory
+    owner: root
+    group: dcv-self-service
+    mode: "0750"
+
+- name: Ensure the DCV self-service application directory exists on the VPN host
+  ansible.builtin.file:
+    path: /opt/dcv-self-service
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Derive the private bind address for the DCV self-service helper
+  ansible.builtin.set_fact:
+    dcv_self_service_bind_address: "{{ ansible_default_ipv4.address | default('127.0.0.1') }}"
+
+- name: Install the shared DCV instance control helper on the VPN host
+  ansible.builtin.template:
+    src: dcv_instance_control.sh.j2
+    dest: /usr/local/bin/dcv-instance-control
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the keyless DCV self-service HTTPS application on the VPN host
+  ansible.builtin.template:
+    src: dcv_self_service_api.py.j2
+    dest: /opt/dcv-self-service/dcv_self_service_api.py
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Generate a persistent CSRF secret for the DCV self-service helper
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - rand
+      - -hex
+      - -out
+      - /etc/dcv-self-service/csrf_secret
+      - "32"
+  args:
+    creates: /etc/dcv-self-service/csrf_secret
+  no_log: true
+
+- name: Set permissions on the DCV self-service CSRF secret
+  ansible.builtin.file:
+    path: /etc/dcv-self-service/csrf_secret
+    owner: root
+    group: dcv-self-service
+    mode: "0640"
+
+- name: Read the DCV self-service CSRF secret
+  ansible.builtin.slurp:
+    src: /etc/dcv-self-service/csrf_secret
+  register: dcv_self_service_csrf_secret_file
+  no_log: true
+
+- name: Install the DCV self-service HTTPS configuration on the VPN host
+  ansible.builtin.template:
+    src: dcv_self_service_config.json.j2
+    dest: /etc/dcv-self-service/config.json
+    owner: root
+    group: dcv-self-service
+    mode: "0640"
+  vars:
+    dcv_self_service_csrf_secret: "{{ dcv_self_service_csrf_secret_file.content | b64decode | trim }}"
+  no_log: true
+
+- name: Generate the DCV self-service HTTPS certificate and private key
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -nodes
+      - -newkey
+      - rsa:2048
+      - -keyout
+      - /etc/dcv-self-service/tls.key
+      - -out
+      - /etc/dcv-self-service/tls.crt
+      - -days
+      - "825"
+      - -subj
+      - "/CN={{ dcv_self_service_bind_address }}"
+      - -addext
+      - "subjectAltName=IP:{{ dcv_self_service_bind_address }}"
+  args:
+    creates: /etc/dcv-self-service/tls.crt
+  no_log: true
+
+- name: Set permissions on the DCV self-service HTTPS private key
+  ansible.builtin.file:
+    path: /etc/dcv-self-service/tls.key
+    owner: root
+    group: dcv-self-service
+    mode: "0640"
+
+- name: Set permissions on the DCV self-service HTTPS certificate
+  ansible.builtin.file:
+    path: /etc/dcv-self-service/tls.crt
+    owner: root
+    group: dcv-self-service
+    mode: "0644"
+
+- name: Install the DCV self-service systemd unit on the VPN host
+  ansible.builtin.template:
+    src: dcv_self_service.service.j2
+    dest: /etc/systemd/system/dcv-self-service.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable and start the DCV self-service HTTPS service on the VPN host
+  ansible.builtin.systemd:
+    name: dcv-self-service.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# VPN PROFILE BLOCK
+# CREATES ONE PIVPN CLIENT PROFILE FOR EACH REQUESTED USER.
+- name: Create VPN profiles for users
+  ansible.builtin.command:
+    cmd: "/usr/local/bin/pivpn add -n {{ item }} -ip auto"
+  args:
+    creates: "{{ pivpn_profile_dir }}/{{ item }}.conf"
+  loop: "{{ vpn_users }}"
+
+# VPN DISCONNECT COST GUARD BLOCK
+# STARTS A USER'S DCV HOST WHEN THEIR WIREGUARD PEER IS ACTIVE AND STOPS IT AFTER THE PEER HAS BEEN INACTIVE FOR THE CONFIGURED GRACE PERIOD.
+- name: Install the VPN disconnect watcher script
+  ansible.builtin.template:
+    src: dcv_disconnect_watcher.sh.j2
+    dest: /usr/local/bin/dcv-vpn-watch
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the VPN disconnect watcher systemd service
+  ansible.builtin.template:
+    src: dcv-vpn-watch.service.j2
+    dest: /etc/systemd/system/dcv-vpn-watch.service
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the VPN disconnect watcher systemd timer
+  ansible.builtin.template:
+    src: dcv-vpn-watch.timer.j2
+    dest: /etc/systemd/system/dcv-vpn-watch.timer
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Enable the VPN disconnect watcher timer
+  ansible.builtin.systemd:
+    name: dcv-vpn-watch.timer
+    enabled: true
+    state: started
+    daemon_reload: true

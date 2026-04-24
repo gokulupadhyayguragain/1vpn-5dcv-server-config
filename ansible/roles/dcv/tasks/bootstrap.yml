@@ -1,0 +1,237 @@
+---
+# DESKTOP BOOTSTRAP STATE BLOCK
+# PREPARES LOCAL MARKERS AND A SELF-CONTAINED INSTALL SCRIPT SO GNOME CAN FINISH EVEN IF SSH RECONNECTS MID-RUN.
+- name: Ensure DCV bootstrap state directory exists
+  ansible.builtin.file:
+    path: "{{ dcv_bootstrap_state_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Install DCV desktop bootstrap script
+  ansible.builtin.copy:
+    dest: "{{ dcv_bootstrap_script_path }}"
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # RUNTIME PATH BLOCK
+      # DEFINES LOG AND MARKER PATHS SO THE HEAVY DESKTOP PHASE CAN BE OBSERVED AND RETRIED SAFELY.
+      LOG_FILE="{{ dcv_bootstrap_log_path }}"
+      STATE_DIR="{{ dcv_bootstrap_state_dir }}"
+      DONE_FILE="{{ dcv_bootstrap_done_marker }}"
+      FAILED_FILE="{{ dcv_bootstrap_failed_marker }}"
+      LOCK_FILE="${STATE_DIR}/desktop-bootstrap.lock"
+
+      mkdir -p "${STATE_DIR}" "$(dirname "${LOG_FILE}")" /etc/NetworkManager/conf.d /etc/needrestart/conf.d /etc/netplan
+      exec 9>"${LOCK_FILE}"
+      flock -n 9 || exit 0
+
+      if [[ -f "${DONE_FILE}" ]]; then
+        exit 0
+      fi
+
+      rm -f "${FAILED_FILE}"
+      exec > >(tee -a "${LOG_FILE}" /dev/ttyS0) 2>&1
+
+      # FAILURE HANDLING BLOCK
+      # MARKS FAILURES CLEARLY SO ANSIBLE CAN STOP EARLY AND SHOW THE BUILD LOG INSTEAD OF HANGING BLINDLY.
+      on_error() {
+        local exit_code="$?"
+        echo "DCV DESKTOP BOOTSTRAP FAILED WITH EXIT CODE ${exit_code} AT $(date -Is)"
+        touch "${FAILED_FILE}"
+        exit "${exit_code}"
+      }
+
+      trap on_error ERR
+
+      echo "DCV DESKTOP BOOTSTRAP STARTED AT $(date -Is)"
+      export DEBIAN_FRONTEND=noninteractive
+      export NEEDRESTART_MODE=a
+      export UCF_FORCE_CONFOLD=1
+
+      # PACKAGE BEHAVIOR BLOCK
+      # KEEPS PACKAGE CONFIGURATION NON-INTERACTIVE AND PREVENTS SERVICES FROM TAKING OVER THE EC2 NIC MID-INSTALL.
+      cat >/usr/sbin/policy-rc.d <<'POLICY_RC_D'
+      #!/bin/sh
+      exit 101
+      POLICY_RC_D
+      chmod 0755 /usr/sbin/policy-rc.d
+
+      cleanup_policy_rc_d() {
+        rm -f /usr/sbin/policy-rc.d
+      }
+
+      trap cleanup_policy_rc_d EXIT
+
+      cat >/etc/needrestart/conf.d/99-dcv-noninteractive.conf <<'NEEDRESTART_CONF'
+      $nrconf{restart} = 'a';
+      NEEDRESTART_CONF
+
+      cat >{{ dcv_networkmanager_unmanaged_path }} <<'NETWORKMANAGER_CONF'
+      [keyfile]
+      unmanaged-devices=interface-name:{{ dcv_primary_interface }}
+      NETWORKMANAGER_CONF
+
+      cat >{{ dcv_netplan_path }} <<'NETPLAN_CONF'
+      network:
+        version: 2
+        renderer: networkd
+        ethernets:
+          {{ dcv_primary_interface }}:
+            dhcp4: true
+            dhcp6: false
+            optional: true
+      NETPLAN_CONF
+
+      systemctl set-default multi-user.target
+      systemctl unmask systemd-networkd.service 2>/dev/null || true
+      systemctl enable systemd-networkd.service 2>/dev/null || true
+      systemctl restart systemd-networkd.service 2>/dev/null || true
+      systemctl unmask systemd-resolved.service 2>/dev/null || true
+      systemctl enable systemd-resolved.service 2>/dev/null || true
+      systemctl restart systemd-resolved.service 2>/dev/null || true
+      systemctl stop systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl mask systemd-networkd-wait-online.service 2>/dev/null || true
+      systemctl unmask ssh.service 2>/dev/null || true
+      systemctl enable ssh.service 2>/dev/null || true
+      systemctl stop ssh.socket 2>/dev/null || true
+      systemctl disable ssh.socket 2>/dev/null || true
+      systemctl mask ssh.socket 2>/dev/null || true
+      systemctl start ssh.service 2>/dev/null || true
+      systemctl stop NetworkManager.service 2>/dev/null || true
+      systemctl disable NetworkManager.service 2>/dev/null || true
+      systemctl mask NetworkManager.service 2>/dev/null || true
+      systemctl stop NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl mask NetworkManager-wait-online.service 2>/dev/null || true
+      systemctl stop ModemManager.service 2>/dev/null || true
+      systemctl disable ModemManager.service 2>/dev/null || true
+      systemctl mask ModemManager.service 2>/dev/null || true
+      systemctl stop gdm3.service 2>/dev/null || true
+      systemctl disable gdm3.service 2>/dev/null || true
+      systemctl mask gdm3.service 2>/dev/null || true
+      netplan generate 2>/dev/null || true
+
+      # DESKTOP INSTALL BLOCK
+      # INSTALLS THE FULL UBUNTU GNOME DESKTOP STACK ON EVERY DCV HOST.
+      apt-get update
+      apt-get -o DPkg::Lock::Timeout=600 install -y {{ dcv_desktop_packages | join(' ') }}
+
+      systemctl daemon-reload 2>/dev/null || true
+      systemctl unmask gdm3.service 2>/dev/null || true
+      systemctl enable gdm3.service 2>/dev/null || true
+      netplan generate 2>/dev/null || true
+      rm -f "${FAILED_FILE}"
+      touch "${DONE_FILE}"
+      echo "DCV DESKTOP BOOTSTRAP COMPLETED AT $(date -Is)"
+
+- name: Install systemd unit for the DCV desktop bootstrap service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/dcv-desktop-bootstrap.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=DCV DESKTOP BOOTSTRAP SERVICE
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart={{ dcv_bootstrap_script_path }}
+      Restart=on-failure
+      RestartSec=15
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Reload systemd after installing the DCV desktop bootstrap service
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Check whether the desktop bootstrap already completed
+  ansible.builtin.stat:
+    path: "{{ dcv_bootstrap_done_marker }}"
+  register: dcv_bootstrap_done
+
+- name: Enable the DCV desktop bootstrap service
+  ansible.builtin.systemd:
+    name: dcv-desktop-bootstrap.service
+    enabled: true
+  when: not dcv_bootstrap_done.stat.exists
+
+- name: Start or resume the DCV desktop bootstrap service
+  ansible.builtin.systemd:
+    name: dcv-desktop-bootstrap.service
+    state: started
+  when: not dcv_bootstrap_done.stat.exists
+
+- name: Wait for the desktop bootstrap to finish through the VPN bastion
+  ansible.builtin.shell: |
+    set -euo pipefail
+    deadline="$(( $(date +%s) + {{ dcv_bootstrap_timeout_seconds }} ))"
+    proxy_command="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 -i {{ lookup('env', 'SSH_PRIVATE_KEY_PATH') | quote }} ubuntu@{{ hostvars[groups['vpn'][0]].ansible_host }} -W %h:%p"
+    ssh_base=(
+      ssh
+      -o BatchMode=yes
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
+      -o GlobalKnownHostsFile=/dev/null
+      -o ConnectTimeout=10
+      -o "ProxyCommand=${proxy_command}"
+      -i "{{ lookup('env', 'SSH_PRIVATE_KEY_PATH') }}"
+      "ubuntu@{{ ansible_host }}"
+    )
+
+    while (( "$(date +%s)" < deadline )); do
+      if "${ssh_base[@]}" "sudo test -f {{ dcv_bootstrap_done_marker }}"; then
+        exit 0
+      fi
+
+      if "${ssh_base[@]}" "sudo test -f {{ dcv_bootstrap_failed_marker }}"; then
+        "${ssh_base[@]}" "sudo tail -n 200 {{ dcv_bootstrap_log_path }}" || true
+        exit 1
+      fi
+
+      if ! "${ssh_base[@]}" "sudo systemctl is-active --quiet dcv-desktop-bootstrap.service"; then
+        "${ssh_base[@]}" "sudo systemctl start dcv-desktop-bootstrap.service" || true
+      fi
+
+      sleep {{ dcv_bootstrap_poll_interval_seconds }}
+    done
+
+    "${ssh_base[@]}" "sudo tail -n 200 {{ dcv_bootstrap_log_path }}" || true
+    echo "TIMED OUT WAITING FOR {{ inventory_hostname }} TO COMPLETE THE DCV DESKTOP BOOTSTRAP."
+    exit 1
+  args:
+    executable: /bin/bash
+  delegate_to: localhost
+  become: false
+  changed_when: false
+
+- name: Re-establish the Ansible connection after desktop bootstrap
+  ansible.builtin.wait_for_connection:
+    timeout: "{{ dcv_bootstrap_timeout_seconds }}"
+    connect_timeout: 10
+    sleep: "{{ dcv_bootstrap_poll_interval_seconds }}"
+
+- name: Check whether Ubuntu requested a reboot after desktop bootstrap
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: dcv_reboot_required
+
+- name: Reboot DCV host when Ubuntu requested it after desktop bootstrap
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ dcv_bootstrap_timeout_seconds }}"
+    connect_timeout: 10
+    post_reboot_delay: 20
+    test_command: systemctl is-active ssh.service
+  when: dcv_reboot_required.stat.exists
+
+- name: Wait for the DCV host to accept Ansible again after the desktop reboot
+  ansible.builtin.wait_for_connection:
+    timeout: "{{ dcv_bootstrap_timeout_seconds }}"
+    connect_timeout: 10
+    sleep: "{{ dcv_bootstrap_poll_interval_seconds }}"
+  when: dcv_reboot_required.stat.exists

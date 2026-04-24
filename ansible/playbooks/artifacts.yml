@@ -1,0 +1,8 @@
+---
+# ARTIFACT PLAY BLOCK
+# EXPORTS PIVPN CLIENT FILES AND UPLOADS THEM TO S3 USER FOLDERS.
+- name: Export VPN profile artifacts
+  hosts: vpn
+  become: true
+  roles:
+    - role: artifacts

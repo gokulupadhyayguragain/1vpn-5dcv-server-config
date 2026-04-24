@@ -1,0 +1,17 @@
+{
+  "project_name": "{{ project_name }}",
+  "aws_region": "{{ aws_region }}",
+  "bind_host": "{{ dcv_self_service_bind_address }}",
+  "port": {{ dcv_self_service_port }},
+  "helper_path": "/usr/local/bin/dcv-instance-control",
+  "tls_cert_path": "/etc/dcv-self-service/tls.crt",
+  "tls_key_path": "/etc/dcv-self-service/tls.key",
+  "csrf_secret": "{{ dcv_self_service_csrf_secret }}",
+  "users": {
+{% for user in vpn_users %}
+    "{{ user }}": {
+      "password_hash": "{{ lookup('pipe', 'openssl passwd -6 -salt ' ~ ((project_name ~ '-' ~ user ~ '-self-service') | hash('sha1'))[:16] ~ ' ' ~ ((lookup('env', 'DCV_PASSWORD_' ~ (user | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_legacy_session_password, true)) | quote)) }}"
+    }{% if not loop.last %},{% endif %}
+{% endfor %}
+  }
+}
