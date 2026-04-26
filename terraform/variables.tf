@@ -38,11 +38,6 @@ variable "dcv_private_ips" {
   type        = list(string)
   default     = []
   description = "Optional static private IP list for DCV instances in private subnet."
-
-  validation {
-    condition     = length(var.dcv_private_ips) == 0 || length(var.dcv_private_ips) == var.dcv_instance_count
-    error_message = "dcv_private_ips must be empty or match dcv_instance_count exactly."
-  }
 }
 
 variable "vpn_client_cidr" {

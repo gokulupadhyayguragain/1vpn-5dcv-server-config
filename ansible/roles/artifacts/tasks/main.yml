@@ -20,6 +20,7 @@
       dcv_host_name: "dcv-{{ artifact_index + 1 }}"
       dcv_private_ip: "{{ hostvars[groups['dcv'][artifact_index]].ansible_host }}"
       dcv_password: "{{ lookup('env', 'DCV_PASSWORD_' ~ (item | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_legacy_session_password, true) }}"
+      vpn_client_ip: "{{ vpn_client_cidr.split('/')[0].split('.')[:3] | join('.') }}.{{ artifact_index + 2 }}"
       local_dir: "{{ artifacts_local_dir }}/{{ item }}"
       local_profile_path: "{{ artifacts_local_dir }}/{{ item }}/{{ item }}.conf"
       local_connection_info_path: "{{ artifacts_local_dir }}/{{ item }}/connection-info-{{ item }}.txt"
@@ -77,6 +78,7 @@
       VPN_ENDPOINT={{ ansible_host }}
       VPN_ENDPOINT_MODE={{ vpn_public_endpoint_mode }}
       VPN_PRIVATE_IP={{ ansible_default_ipv4.address | default('unknown') }}
+      VPN_CLIENT_IP={{ item.vpn_client_ip }}
       VPN_PORT=51820
       DCV_HOST_NAME={{ item.dcv_host_name }}
       DCV_PRIVATE_IP={{ item.dcv_private_ip }}

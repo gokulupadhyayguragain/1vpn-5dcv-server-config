@@ -378,10 +378,12 @@
 # CREATES ONE PIVPN CLIENT PROFILE FOR EACH REQUESTED USER.
 - name: Create VPN profiles for users
   ansible.builtin.command:
-    cmd: "/usr/local/bin/pivpn add -n {{ item }} -ip auto"
+    cmd: "/usr/local/bin/pivpn add -n {{ item }} -ip {{ vpn_client_cidr.split('/')[0].split('.')[:3] | join('.') }}.{{ vpn_user_index + 2 }}"
   args:
     creates: "{{ pivpn_profile_dir }}/{{ item }}.conf"
   loop: "{{ vpn_users }}"
+  loop_control:
+    index_var: vpn_user_index
 
 # VPN DISCONNECT COST GUARD BLOCK
 # STARTS A USER'S DCV HOST WHEN THEIR WIREGUARD PEER IS ACTIVE AND STOPS IT AFTER THE PEER HAS BEEN INACTIVE FOR THE CONFIGURED GRACE PERIOD.

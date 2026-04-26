@@ -30,8 +30,171 @@ load_env_only() {
   source "$ROOT_DIR/scripts/load_env.sh" "$ROOT_DIR/.env"
 }
 
+terraform_outputs_available() {
+  "$ROOT_DIR/scripts/ensure_terraform_outputs.sh" >/dev/null 2>&1 \
+    && (cd "$ROOT_DIR/terraform" && terraform output -json 2>/dev/null | jq -e 'type == "object" and length > 0' >/dev/null 2>&1)
+}
+
+resolve_vpn_public_ip() {
+  local vpn_public_ip=""
+
+  if terraform_outputs_available; then
+    vpn_public_ip="$(cd "$ROOT_DIR/terraform" && terraform output -raw vpn_public_ip 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$vpn_public_ip" || "$vpn_public_ip" == "None" ]]; then
+    if ! command -v aws >/dev/null 2>&1; then
+      echo "ERROR: Terraform outputs are unavailable and aws CLI is not installed for live VPN discovery." >&2
+      return 1
+    fi
+
+    vpn_public_ip="$(aws ec2 describe-instances \
+      --region "$AWS_REGION" \
+      --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpn" "Name=instance-state-name,Values=running" \
+      --query 'Reservations[].Instances[].PublicIpAddress' \
+      --output text)"
+  fi
+
+  if [[ -z "$vpn_public_ip" || "$vpn_public_ip" == "None" ]]; then
+    echo "ERROR: Could not resolve a running VPN public IP for project ${PROJECT_NAME}." >&2
+    return 1
+  fi
+
+  printf '%s\n' "$vpn_public_ip"
+}
+
+check_vpn_ssh_access() {
+  local vpn_public_ip="$1"
+  local ssh_error=""
+  local vpn_key_name=""
+
+  if ssh "${SSH_MENU_ARGS[@]}" \
+    -o BatchMode=yes \
+    -i "$SSH_PRIVATE_KEY_PATH" \
+    "ubuntu@$vpn_public_ip" \
+    "true" >/dev/null 2>/tmp/dcv-menu-vpn-ssh.err; then
+    return 0
+  fi
+
+  ssh_error="$(cat /tmp/dcv-menu-vpn-ssh.err 2>/dev/null || true)"
+  echo "ERROR: Cannot authenticate to VPN SSH at ${vpn_public_ip} with SSH_PRIVATE_KEY_PATH=${SSH_PRIVATE_KEY_PATH}." >&2
+
+  if command -v aws >/dev/null 2>&1; then
+    vpn_key_name="$(aws ec2 describe-instances \
+      --region "$AWS_REGION" \
+      --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpn" "Name=instance-state-name,Values=running" \
+      --query 'Reservations[].Instances[].KeyName' \
+      --output text 2>/dev/null || true)"
+    if [[ -n "$vpn_key_name" && "$vpn_key_name" != "None" ]]; then
+      echo "EC2 reports the VPN instance key pair is: ${vpn_key_name}" >&2
+    fi
+  fi
+
+  if [[ "$ssh_error" == *"Permission denied"* ]]; then
+    echo "The configured private key does not match the EC2 key pair. Update SSH_PRIVATE_KEY_PATH in .env to the private key for that key pair, then retry." >&2
+  else
+    echo "$ssh_error" >&2
+  fi
+
+  return 1
+}
+
+load_dcv_host_rows() {
+  local dcv_private_ip=""
+  local dcv_private_ips=()
+  local host_num=0
+
+  DCV_HOST_ROWS=()
+
+  if command -v aws >/dev/null 2>&1; then
+    mapfile -t DCV_HOST_ROWS < <(aws ec2 describe-instances \
+      --region "$AWS_REGION" \
+      --filters "Name=tag:Name,Values=${PROJECT_NAME}-dcv-*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+      --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,PrivateIpAddress,State.Name]' \
+      --output text | sort -V)
+  fi
+
+  if [[ "${#DCV_HOST_ROWS[@]}" -eq 0 ]] && terraform_outputs_available; then
+    mapfile -t dcv_private_ips < <(cd "$ROOT_DIR/terraform" && terraform output -json dcv_private_ips | jq -r '.[]')
+    for dcv_private_ip in "${dcv_private_ips[@]}"; do
+      host_num="$((host_num + 1))"
+      DCV_HOST_ROWS+=("dcv-${host_num}"$'\t'"${dcv_private_ip}"$'\t'"unknown")
+    done
+  fi
+
+  if [[ "${#DCV_HOST_ROWS[@]}" -eq 0 ]]; then
+    echo "ERROR: No DCV hosts were found from Terraform outputs or live AWS tags." >&2
+    return 1
+  fi
+}
+
+load_dcv_assignment_rows() {
+  local index=0
+  local user_name=""
+  local host_row=""
+  local host_ip=""
+  local host_state=""
+
+  DCV_ASSIGNMENT_ROWS=()
+
+  if terraform_outputs_available \
+    && (cd "$ROOT_DIR/terraform" && terraform output -json dcv_user_assignments >/dev/null 2>&1); then
+    mapfile -t DCV_ASSIGNMENT_ROWS < <(cd "$ROOT_DIR/terraform" && terraform output -json dcv_user_assignments | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+    if [[ "${#DCV_ASSIGNMENT_ROWS[@]}" -gt 0 ]]; then
+      return 0
+    fi
+  fi
+
+  normalize_vpn_users_array "${VPN_USERS_CSV:-}"
+  load_dcv_host_rows
+
+  for index in "${!VPN_USERS_LIST[@]}"; do
+    if (( index >= ${#DCV_HOST_ROWS[@]} )); then
+      break
+    fi
+    user_name="${VPN_USERS_LIST[$index]}"
+    host_row="${DCV_HOST_ROWS[$index]}"
+    host_ip="$(printf '%s\n' "$host_row" | awk -F'\t' '{print $2}')"
+    host_state="$(printf '%s\n' "$host_row" | awk -F'\t' '{print $3}')"
+    DCV_ASSIGNMENT_ROWS+=("${user_name}"$'\t'"${host_ip}"$'\t'"${host_state}")
+  done
+
+  if [[ "${#DCV_ASSIGNMENT_ROWS[@]}" -eq 0 ]]; then
+    echo "ERROR: No DCV user assignments were found from Terraform outputs, .env, or live AWS tags." >&2
+    return 1
+  fi
+}
+
 show_outputs() {
-  "$ROOT_DIR/scripts/ensure_terraform_outputs.sh" >/dev/null
+  local vpn_public_ip=""
+  local vpn_private_ip=""
+  local dcv_rows=()
+
+  if ! terraform_outputs_available; then
+    load_valid_env inventory
+    echo "Terraform outputs are unavailable; showing live AWS hosts discovered by tags."
+    echo
+
+    vpn_public_ip="$(resolve_vpn_public_ip)"
+    vpn_private_ip="$(aws ec2 describe-instances \
+      --region "$AWS_REGION" \
+      --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpn" "Name=instance-state-name,Values=running" \
+      --query 'Reservations[].Instances[].PrivateIpAddress' \
+      --output text)"
+    mapfile -t dcv_rows < <(aws ec2 describe-instances \
+      --region "$AWS_REGION" \
+      --filters "Name=tag:Name,Values=${PROJECT_NAME}-dcv-*" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+      --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,PrivateIpAddress,State.Name,InstanceId]' \
+      --output text | sort -V)
+
+    echo "vpn_public_ip = ${vpn_public_ip}"
+    echo "vpn_private_ip = ${vpn_private_ip}"
+    echo "s3_bucket_name = ${S3_BUCKET_NAME:-}"
+    echo "dcv_hosts:"
+    printf '  %s\n' "${dcv_rows[@]}"
+    return
+  fi
+
   (
     cd "$ROOT_DIR/terraform"
     terraform output
@@ -361,8 +524,10 @@ scale_dcv_fleet() {
 
 ssh_vpn_host() {
   load_valid_env inventory
-  "$ROOT_DIR/scripts/ensure_terraform_outputs.sh" >/dev/null
-  vpn_public_ip="$(cd "$ROOT_DIR/terraform" && terraform output -raw vpn_public_ip)"
+  vpn_public_ip="$(resolve_vpn_public_ip)"
+  if ! check_vpn_ssh_access "$vpn_public_ip"; then
+    return
+  fi
   ssh "${SSH_MENU_ARGS[@]}" -i "$SSH_PRIVATE_KEY_PATH" "ubuntu@$vpn_public_ip"
 }
 
@@ -370,64 +535,77 @@ ssh_dcv_host() {
   local selected_index=""
   local vpn_public_ip=""
   local selected_ip=""
+  local selected_state=""
+  local host_row=""
+  local host_name=""
 
   load_valid_env inventory
-  "$ROOT_DIR/scripts/ensure_terraform_outputs.sh" >/dev/null
-  vpn_public_ip="$(cd "$ROOT_DIR/terraform" && terraform output -raw vpn_public_ip)"
-  mapfile -t dcv_private_ips < <(cd "$ROOT_DIR/terraform" && terraform output -json dcv_private_ips | jq -r '.[]')
-
-  if [[ "${#dcv_private_ips[@]}" -eq 0 ]]; then
-    echo "No DCV hosts were found in Terraform outputs."
+  vpn_public_ip="$(resolve_vpn_public_ip)"
+  if ! check_vpn_ssh_access "$vpn_public_ip"; then
     return
   fi
+  load_dcv_host_rows
 
   echo "Available DCV hosts:"
-  for index in "${!dcv_private_ips[@]}"; do
-    echo "  $((index + 1))) ${dcv_private_ips[$index]}"
+  for index in "${!DCV_HOST_ROWS[@]}"; do
+    host_name="$(printf '%s\n' "${DCV_HOST_ROWS[$index]}" | awk -F'\t' '{print $1}')"
+    selected_ip="$(printf '%s\n' "${DCV_HOST_ROWS[$index]}" | awk -F'\t' '{print $2}')"
+    selected_state="$(printf '%s\n' "${DCV_HOST_ROWS[$index]}" | awk -F'\t' '{print $3}')"
+    echo "  $((index + 1))) ${host_name} ${selected_ip} (${selected_state})"
   done
 
   read -r -p "Select DCV host number: " selected_index
-  if [[ ! "$selected_index" =~ ^[1-9][0-9]*$ ]] || (( selected_index > ${#dcv_private_ips[@]} )); then
+  if [[ ! "$selected_index" =~ ^[1-9][0-9]*$ ]] || (( selected_index > ${#DCV_HOST_ROWS[@]} )); then
     echo "Invalid selection."
     return
   fi
 
-  selected_ip="${dcv_private_ips[$((selected_index - 1))]}"
-  ssh "${SSH_MENU_ARGS[@]}" -o "ProxyCommand=$(build_proxy_command "$vpn_public_ip")" -i "$SSH_PRIVATE_KEY_PATH" "ubuntu@$selected_ip"
+  host_row="${DCV_HOST_ROWS[$((selected_index - 1))]}"
+  selected_ip="$(printf '%s\n' "$host_row" | awk -F'\t' '{print $2}')"
+  selected_state="$(printf '%s\n' "$host_row" | awk -F'\t' '{print $3}')"
+
+  if [[ "$selected_state" != "running" && "$selected_state" != "unknown" ]]; then
+    echo "Selected DCV host is ${selected_state}; start or replace it before SSH."
+    return
+  fi
+
+  ssh "${SSH_MENU_ARGS[@]}" -J "ubuntu@$vpn_public_ip" -i "$SSH_PRIVATE_KEY_PATH" "ubuntu@$selected_ip"
 }
 
 control_dcv_power_state() {
   local selected_index=""
   local selected_user=""
   local selected_private_ip=""
+  local selected_state=""
   local selected_action=""
   local vpn_public_ip=""
-  local assignment_entries=()
 
   load_valid_env inventory
-  "$ROOT_DIR/scripts/ensure_terraform_outputs.sh" >/dev/null
-  vpn_public_ip="$(cd "$ROOT_DIR/terraform" && terraform output -raw vpn_public_ip)"
-  mapfile -t assignment_entries < <(cd "$ROOT_DIR/terraform" && terraform output -json dcv_user_assignments | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
-
-  if [[ "${#assignment_entries[@]}" -eq 0 ]]; then
-    echo "No DCV user assignments were found in Terraform outputs."
+  vpn_public_ip="$(resolve_vpn_public_ip)"
+  if ! check_vpn_ssh_access "$vpn_public_ip"; then
     return
   fi
+  load_dcv_assignment_rows
 
   echo "Available DCV assignments:"
-  for index in "${!assignment_entries[@]}"; do
-    selected_user="${assignment_entries[$index]%%$'\t'*}"
-    selected_private_ip="${assignment_entries[$index]#*$'\t'}"
-    echo "  $((index + 1))) ${selected_user} -> ${selected_private_ip}"
+  for index in "${!DCV_ASSIGNMENT_ROWS[@]}"; do
+    selected_user="$(printf '%s\n' "${DCV_ASSIGNMENT_ROWS[$index]}" | awk -F'\t' '{print $1}')"
+    selected_private_ip="$(printf '%s\n' "${DCV_ASSIGNMENT_ROWS[$index]}" | awk -F'\t' '{print $2}')"
+    selected_state="$(printf '%s\n' "${DCV_ASSIGNMENT_ROWS[$index]}" | awk -F'\t' '{print $3}')"
+    if [[ -n "$selected_state" ]]; then
+      echo "  $((index + 1))) ${selected_user} -> ${selected_private_ip} (${selected_state})"
+    else
+      echo "  $((index + 1))) ${selected_user} -> ${selected_private_ip}"
+    fi
   done
 
   read -r -p "Select assignment number: " selected_index
-  if [[ ! "$selected_index" =~ ^[1-9][0-9]*$ ]] || (( selected_index > ${#assignment_entries[@]} )); then
+  if [[ ! "$selected_index" =~ ^[1-9][0-9]*$ ]] || (( selected_index > ${#DCV_ASSIGNMENT_ROWS[@]} )); then
     echo "Invalid selection."
     return
   fi
 
-  selected_user="${assignment_entries[$((selected_index - 1))]%%$'\t'*}"
+  selected_user="$(printf '%s\n' "${DCV_ASSIGNMENT_ROWS[$((selected_index - 1))]}" | awk -F'\t' '{print $1}')"
   echo "1) status"
   echo "2) start"
   echo "3) stop"
@@ -457,30 +635,41 @@ show_dcv_build_log() {
   local selected_index=""
   local vpn_public_ip=""
   local selected_ip=""
+  local selected_state=""
+  local host_row=""
+  local host_name=""
 
   load_valid_env inventory
-  "$ROOT_DIR/scripts/ensure_terraform_outputs.sh" >/dev/null
-  vpn_public_ip="$(cd "$ROOT_DIR/terraform" && terraform output -raw vpn_public_ip)"
-  mapfile -t dcv_private_ips < <(cd "$ROOT_DIR/terraform" && terraform output -json dcv_private_ips | jq -r '.[]')
-
-  if [[ "${#dcv_private_ips[@]}" -eq 0 ]]; then
-    echo "No DCV hosts were found in Terraform outputs."
+  vpn_public_ip="$(resolve_vpn_public_ip)"
+  if ! check_vpn_ssh_access "$vpn_public_ip"; then
     return
   fi
+  load_dcv_host_rows
 
   echo "Available DCV hosts:"
-  for index in "${!dcv_private_ips[@]}"; do
-    echo "  $((index + 1))) ${dcv_private_ips[$index]}"
+  for index in "${!DCV_HOST_ROWS[@]}"; do
+    host_name="$(printf '%s\n' "${DCV_HOST_ROWS[$index]}" | awk -F'\t' '{print $1}')"
+    selected_ip="$(printf '%s\n' "${DCV_HOST_ROWS[$index]}" | awk -F'\t' '{print $2}')"
+    selected_state="$(printf '%s\n' "${DCV_HOST_ROWS[$index]}" | awk -F'\t' '{print $3}')"
+    echo "  $((index + 1))) ${host_name} ${selected_ip} (${selected_state})"
   done
 
   read -r -p "Select DCV host number: " selected_index
-  if [[ ! "$selected_index" =~ ^[1-9][0-9]*$ ]] || (( selected_index > ${#dcv_private_ips[@]} )); then
+  if [[ ! "$selected_index" =~ ^[1-9][0-9]*$ ]] || (( selected_index > ${#DCV_HOST_ROWS[@]} )); then
     echo "Invalid selection."
     return
   fi
 
-  selected_ip="${dcv_private_ips[$((selected_index - 1))]}"
-  ssh "${SSH_MENU_ARGS[@]}" -o "ProxyCommand=$(build_proxy_command "$vpn_public_ip")" -i "$SSH_PRIVATE_KEY_PATH" "ubuntu@$selected_ip" "sudo tail -n 200 /var/log/dcv-desktop-bootstrap.log"
+  host_row="${DCV_HOST_ROWS[$((selected_index - 1))]}"
+  selected_ip="$(printf '%s\n' "$host_row" | awk -F'\t' '{print $2}')"
+  selected_state="$(printf '%s\n' "$host_row" | awk -F'\t' '{print $3}')"
+
+  if [[ "$selected_state" != "running" && "$selected_state" != "unknown" ]]; then
+    echo "Selected DCV host is ${selected_state}; start or replace it before reading logs."
+    return
+  fi
+
+  ssh "${SSH_MENU_ARGS[@]}" -J "ubuntu@$vpn_public_ip" -i "$SSH_PRIVATE_KEY_PATH" "ubuntu@$selected_ip" "sudo tail -n 200 /var/log/dcv-desktop-bootstrap.log"
 }
 
 confirm_destroy() {
@@ -569,6 +758,20 @@ reset_all_dcv_passwords() {
   prompt_apply_dcv_password_changes
 }
 
+build_golden_ami() {
+  local confirmation=""
+
+  echo "This launches one temporary On-Demand DCV builder, configures it, creates a sanitized Golden AMI, updates AMI_ID in .env, then terminates the builder."
+  read -r -p "Type BUILDAMI to continue: " confirmation
+
+  if [[ "$confirmation" != "BUILDAMI" ]]; then
+    echo "Golden AMI build cancelled."
+    return
+  fi
+
+  "$ROOT_DIR/scripts/build_dcv_golden_ami.sh"
+}
+
 while true; do
   cat <<'EOF'
 
@@ -580,6 +783,7 @@ S) SET UP LOCAL MACHINE
 2) CREATE OR UPDATE INFRASTRUCTURE ONLY
 3) RUN ANSIBLE CONFIGURATION ONLY
 M) SCALE DCV HOST COUNT AND AMI SETTINGS
+G) BUILD SANITIZED GOLDEN DCV AMI
 4) RUN CHECKS
 5) REGENERATE INVENTORY
 6) SHOW TERRAFORM OUTPUTS
@@ -618,6 +822,9 @@ EOF
       ;;
     M|m)
       scale_dcv_fleet
+      ;;
+    G|g)
+      build_golden_ami
       ;;
     4)
       "$ROOT_DIR/check.sh"

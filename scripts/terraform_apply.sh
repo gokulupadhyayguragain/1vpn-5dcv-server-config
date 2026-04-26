@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TERRAFORM_APPLY_ARGS=("$@")
 source "$SCRIPT_DIR/load_local_tooling.sh"
+"$SCRIPT_DIR/update_admin_cidr.sh" "$ROOT_DIR/.env"
 source "$SCRIPT_DIR/export_tf_vars.sh" "$ROOT_DIR/.env"
 
 # APPLY BLOCK

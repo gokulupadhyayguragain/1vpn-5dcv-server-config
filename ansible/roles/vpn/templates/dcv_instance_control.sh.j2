@@ -162,10 +162,20 @@ case "$ACTION" in
       exit 0
     fi
 
-    aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$TARGET_INSTANCE_ID" >/dev/null
+    if ! start_output="$(aws ec2 start-instances --region "$AWS_REGION" --instance-ids "$TARGET_INSTANCE_ID" 2>&1)"; then
+      logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=start STATE=retry-needed INSTANCE_ID=${TARGET_INSTANCE_ID} ERROR=${start_output}"
+      print_status
+      echo "READY=START_RETRY_NEEDED"
+      echo "MESSAGE=AWS did not start the instance yet. The VPN watcher will retry automatically."
+      exit 0
+    fi
+
     if ! wait_for_instance_state "running" 48; then
-      echo "ERROR: Instance ${TARGET_INSTANCE_ID} did not reach the running state within the expected time."
-      exit 1
+      logger -t dcv-instance-control "MODE=${MODE#--} USER=${TARGET_USER} ACTION=start STATE=still-pending INSTANCE_ID=${TARGET_INSTANCE_ID}"
+      print_status
+      echo "READY=START_RETRY_NEEDED"
+      echo "MESSAGE=Instance did not reach running yet. The VPN watcher will retry automatically."
+      exit 0
     fi
 
     if wait_for_instance_status_ok 36; then

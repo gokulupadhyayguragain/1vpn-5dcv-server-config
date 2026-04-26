@@ -1,0 +1,7 @@
+---
+- name: Configure DCV servers only
+  hosts: dcv
+  become: true
+  roles:
+    - common
+    - dcv

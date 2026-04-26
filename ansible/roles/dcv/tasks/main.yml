@@ -7,6 +7,7 @@
     dcv_connection_user_key_suffix: "{{ vpn_users[groups.get('dcv', []).index(inventory_hostname)] | regex_replace('[^A-Za-z0-9]', '_') | upper }}"
     dcv_session_password: "{{ lookup('env', 'DCV_PASSWORD_' ~ (vpn_users[groups.get('dcv', []).index(inventory_hostname)] | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_legacy_session_password, true) }}"
     dcv_user_sudo: "{{ (lookup('env', 'DCV_SUDO_' ~ (vpn_users[groups.get('dcv', []).index(inventory_hostname)] | regex_replace('[^A-Za-z0-9]', '_') | upper)) | default(dcv_default_user_sudo_raw, true)) | bool }}"
+    dcv_allowed_vpn_client_ip: "{{ vpn_client_cidr.split('/')[0].split('.')[:3] | join('.') }}.{{ groups.get('dcv', []).index(inventory_hostname) + 2 }}"
   no_log: true
 
 # NETWORK IDENTITY BLOCK
@@ -142,16 +143,44 @@
     proto: tcp
     src: "{{ vpn_client_cidr }}"
 
-- name: Allow DCV TCP 8443 from VPN client CIDR
+- name: Remove broad VPN client CIDR access to DCV TCP 8443
   community.general.ufw:
     rule: allow
+    delete: true
     port: "8443"
     proto: tcp
     src: "{{ vpn_client_cidr }}"
 
+- name: Allow this user's VPN client IP to DCV TCP 8443
+  community.general.ufw:
+    rule: allow
+    port: "8443"
+    proto: tcp
+    src: "{{ dcv_allowed_vpn_client_ip }}/32"
+
 # PRIVATE DCV EAST-WEST ACCESS BLOCK
-# ALLOWS PRIVATE-SUBNET TRAFFIC BETWEEN DCV HOSTS SO THEY CAN PING EACH OTHER AND SUPPORT INTERNAL SSH OR LATENCY TESTS.
-- name: Allow private-subnet east-west traffic between DCV hosts
+# ALLOWS DCV HOSTS TO TEST APP PORTS SUCH AS 3000 BETWEEN EACH OTHER, WHILE STILL BLOCKING SSH AND DCV DESKTOP BETWEEN PEER DCV HOSTS.
+- name: Remove broad private-subnet east-west allow rule before ordered DCV host rules
+  community.general.ufw:
+    rule: allow
+    delete: true
+    src: "{{ private_subnet_cidr }}"
+
+- name: Deny private-subnet peer SSH between DCV hosts
+  community.general.ufw:
+    rule: deny
+    port: "22"
+    proto: tcp
+    src: "{{ private_subnet_cidr }}"
+
+- name: Deny private-subnet peer DCV desktop between DCV hosts
+  community.general.ufw:
+    rule: deny
+    port: "8443"
+    proto: tcp
+    src: "{{ private_subnet_cidr }}"
+
+- name: Allow private-subnet east-west app traffic between DCV hosts
   community.general.ufw:
     rule: allow
     src: "{{ private_subnet_cidr }}"
@@ -489,10 +518,28 @@
       - dcv_package_debs.matched | int > 0
     fail_msg: "NO NICE DCV .DEB PACKAGES WERE FOUND UNDER {{ dcv_extract_dir }} AFTER EXTRACTION."
 
-- name: Install NICE DCV server packages
+- name: Derive NICE DCV server package install order
+  ansible.builtin.set_fact:
+    dcv_server_package_debs: "{{ dcv_package_debs.files | selectattr('path', 'search', '/nice-dcv-server_[^/]+\\.deb$') | sort(attribute='path') | list }}"
+    dcv_addon_package_debs: "{{ dcv_package_debs.files | rejectattr('path', 'search', '/nice-dcv-server_[^/]+\\.deb$') | sort(attribute='path') | list }}"
+
+- name: Fail when the NICE DCV server package was not found
+  ansible.builtin.assert:
+    that:
+      - dcv_server_package_debs | length > 0
+    fail_msg: "NO nice-dcv-server .DEB PACKAGE WAS FOUND UNDER {{ dcv_extract_dir }} AFTER EXTRACTION."
+
+- name: Install NICE DCV server package before dependent add-ons
   ansible.builtin.apt:
     deb: "{{ item.path }}"
-  loop: "{{ dcv_package_debs.files }}"
+  loop: "{{ dcv_server_package_debs }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+
+- name: Install NICE DCV add-on packages
+  ansible.builtin.apt:
+    deb: "{{ item.path }}"
+  loop: "{{ dcv_addon_package_debs }}"
   loop_control:
     label: "{{ item.path | basename }}"
 
@@ -675,6 +722,15 @@
       [Service]
       Type=oneshot
       ExecStart=/usr/local/bin/dcv-idle-stop-watch
+
+- name: Seed DCV idle stop grace timer after provisioning
+  ansible.builtin.shell: |
+    set -euo pipefail
+    mkdir -p /var/lib/dcv-idle-stop
+    date +%s > /var/lib/dcv-idle-stop/no_connection_since
+  args:
+    executable: /bin/bash
+  changed_when: true
 
 - name: Install DCV idle stop watcher systemd timer
   ansible.builtin.copy:

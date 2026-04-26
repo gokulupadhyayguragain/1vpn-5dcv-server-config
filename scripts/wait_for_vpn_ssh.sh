@@ -7,9 +7,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/load_local_tooling.sh"
 source "$SCRIPT_DIR/validate_env.sh" --scope=inventory "$ROOT_DIR/.env"
-"$SCRIPT_DIR/ensure_terraform_outputs.sh" >/dev/null
 
-vpn_public_ip="$(cd "$ROOT_DIR/terraform" && terraform output -raw vpn_public_ip)"
+if "$SCRIPT_DIR/ensure_terraform_outputs.sh" >/dev/null 2>&1 \
+  && vpn_public_ip="$(cd "$ROOT_DIR/terraform" && terraform output -raw vpn_public_ip 2>/dev/null)"; then
+  :
+else
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "ERROR: Terraform outputs are unavailable and aws CLI is not installed for VPN SSH discovery." >&2
+    exit 1
+  fi
+
+  vpn_public_ip="$(aws ec2 describe-instances \
+    --region "$AWS_REGION" \
+    --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpn" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].PublicIpAddress' \
+    --output text)"
+fi
+
+if [[ -z "$vpn_public_ip" || "$vpn_public_ip" == "None" ]]; then
+  echo "ERROR: Could not resolve a running VPN public IP for project ${PROJECT_NAME}." >&2
+  exit 1
+fi
+
 deadline="$(( $(date +%s) + ${VPN_SSH_WAIT_TIMEOUT_SECONDS:-600} ))"
 attempt=0
 

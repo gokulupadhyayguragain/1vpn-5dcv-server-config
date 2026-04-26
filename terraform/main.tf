@@ -228,13 +228,6 @@ resource "aws_security_group" "dcv" {
     cidr_blocks = [var.vpn_client_cidr]
   }
 
-  ingress {
-    from_port   = 8443
-    to_port     = 8443
-    protocol    = "tcp"
-    cidr_blocks = [var.vpn_client_cidr]
-  }
-
   # EAST-WEST ACCESS BLOCK
   # ALLOWS DCV HOSTS THAT SHARE THIS SECURITY GROUP TO REACH EACH OTHER FOR PING, SSH TESTING, AND PRIVATE-SUBNET TROUBLESHOOTING.
   ingress {
@@ -249,6 +242,33 @@ resource "aws_security_group" "dcv" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "dcv_user" {
+  count       = var.dcv_instance_count
+  name        = "${var.project_name}-dcv-${count.index + 1}-user-sg"
+  description = "Per-user DCV web access for ${local.normalized_vpn_users[count.index]}"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 8443
+    to_port     = 8443
+    protocol    = "tcp"
+    cidr_blocks = ["${cidrhost(var.vpn_client_cidr, count.index + 2)}/32"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name    = "${var.project_name}-dcv-${count.index + 1}-user-sg"
+    Role    = "dcv-user-access"
+    VpnUser = local.normalized_vpn_users[count.index]
   }
 }
 
@@ -321,11 +341,11 @@ resource "aws_instance" "dcv" {
   ami                                  = local.ubuntu_ami_id
   instance_type                        = var.dcv_instance_type
   subnet_id                            = aws_subnet.private.id
-  vpc_security_group_ids               = [aws_security_group.dcv.id]
+  vpc_security_group_ids               = [aws_security_group.dcv.id, aws_security_group.dcv_user[count.index].id]
   key_name                             = aws_key_pair.main.key_name
   instance_initiated_shutdown_behavior = var.dcv_use_spot ? null : "stop"
   associate_public_ip_address          = false
-  private_ip                           = length(var.dcv_private_ips) > 0 ? var.dcv_private_ips[count.index] : null
+  private_ip                           = length(var.dcv_private_ips) == var.dcv_instance_count ? var.dcv_private_ips[count.index] : null
 
   root_block_device {
     volume_size           = var.dcv_root_volume_size_gb

@@ -13,7 +13,7 @@ dcv_vpn_active_seconds: "{{ lookup('env', 'DCV_VPN_ACTIVE_SECONDS') | default('1
 dcv_disconnect_grace_seconds: "{{ lookup('env', 'DCV_DISCONNECT_GRACE_SECONDS') | default('600', true) | int }}"
 dcv_idle_timeout_minutes: "{{ lookup('env', 'DCV_IDLE_TIMEOUT_MINUTES') | default('10', true) | int }}"
 dcv_idle_timeout_warning_seconds: "{{ lookup('env', 'DCV_IDLE_TIMEOUT_WARNING_SECONDS') | default('120', true) | int }}"
-dcv_stop_after_idle_disconnect_seconds: "{{ lookup('env', 'DCV_STOP_AFTER_IDLE_DISCONNECT_SECONDS') | default('60', true) | int }}"
+dcv_stop_after_idle_disconnect_seconds: "{{ lookup('env', 'DCV_STOP_AFTER_IDLE_DISCONNECT_SECONDS') | default('600', true) | int }}"
 vpn_client_network: "{{ vpn_client_cidr.split('/')[0] }}"
 vpn_client_prefix: "{{ vpn_client_cidr.split('/')[1] | int }}"
 vpn_users_csv: "{{ lookup('env', 'VPN_USERS_CSV') | default('user1,user2', true) }}"
